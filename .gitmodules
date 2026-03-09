@@ -1,0 +1,3 @@
+[submodule "planetary_robot_zoo"]
+	path = planetary_robot_zoo
+	url = git@github.com:WMR-team/planetary_robot_zoo.git
