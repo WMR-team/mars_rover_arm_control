@@ -1,0 +1,15 @@
+#
+policy_path: ""
+xml_path: ""
+
+# Total simulation time
+simulation_duration: 600.0
+# Simulation time step
+simulation_dt: 0.002
+# Controller update frequency (meets the requirement of simulation_dt * controll_decimation=0.02; 50Hz)
+control_decimation: 10
+
+# MuJoCo actuator interpretation:
+# - anymal_c.xml uses <position ...> actuators, so `ctrl` is a joint position target (radians).
+# - for robots using <motor ...> actuators, set this to "torque".
+actuator_mode: torque
