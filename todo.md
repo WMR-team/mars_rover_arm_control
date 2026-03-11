@@ -7,4 +7,13 @@
 - 不同的控制算法
 - 轮速控制的打印
 - 整机的力分配
-- 
+- upadte config files and xml paths and related...
+- 机械臂一开始的时候先收起来
+- 有一些绝对路径要改掉
+- pinocchio可能需要部分求逆运动学
+
+
+
+Thanks to
+- litchicheng
+- 还需要导出对应的urdf
