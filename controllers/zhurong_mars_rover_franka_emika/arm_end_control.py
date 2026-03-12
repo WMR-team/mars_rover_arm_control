@@ -329,14 +329,24 @@ class CustomViewer:
         self.initial_mj_q = mj_data.qpos[:qpos_len].copy()
         self.cur_mj_q = mj_data.qpos[:qpos_len].copy()
         print(f"Initial joint positions: {self.initial_mj_q}")
-        theta = -np.pi
+        theta_x = 0.0  # 旋转角度，单位为弧度
+        theta_y = np.pi/2  # 旋转角度，单位为弧度
         self.R_x = np.array(
             [
                 [1, 0, 0],
-                [0, np.cos(theta), -np.sin(theta)],
-                [0, np.sin(theta), np.cos(theta)],
+                [0, np.cos(theta_x), -np.sin(theta_x)],
+                [0, np.sin(theta_x), np.cos(theta_x)],
             ]
         )
+        self.R_y = np.array(
+            [
+                [np.cos(theta_y), 0, np.sin(theta_y)],
+                [0, 1, 0],
+                [-np.sin(theta_y), 0, np.cos(theta_y)],
+            ]
+        )
+        self.R = self.R_y @ self.R_x
+
 
         self.new_mj_q = self.initial_mj_q
 
@@ -400,7 +410,7 @@ class CustomViewer:
             else:
                 cur_ph_q = last_ik_q
 
-            new_ph_q, ik_success = inverse_arm_kinematics(cur_ph_q, self.R_x, [x, y, z])
+            new_ph_q, ik_success = inverse_arm_kinematics(cur_ph_q, self.R, [x, y, z])
             if ik_success:
                 last_ik_q = np.array(new_ph_q, dtype=float)
                 ik_fail_count = 0
