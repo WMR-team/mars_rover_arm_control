@@ -27,8 +27,8 @@ target_y_step: 0.002
 target_y_speed: 0.1
 control_print_every: 5
 control_start_delay: 5.0
-control_ramp_time: 2.0
-control_max_delta: 0.05
+control_ramp_time: 1.0
+control_max_delta: 0.10
 
 # IK settings
 ik_eps: 0.01
