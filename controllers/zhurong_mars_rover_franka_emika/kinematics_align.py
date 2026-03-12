@@ -13,7 +13,6 @@ import os
 import numpy as np
 import pinocchio
 from numpy.linalg import norm, solve
-import pinocchio_kinematic
 from typing import List
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,6 +74,29 @@ def print_pinocchio_q():
             #   f"parent = {joint.parent}"
             )
     print("-"*40)
+
+def print_mujoco_actuator_info():
+    for i in range(mj_model.nu):  # nu = number of actuators
+        name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+        trnid = mj_model.actuator_trnid[i]  # [joint_id, ...]
+        joint_id = trnid[0]
+        joint_name = mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+        act_type = mj_model.actuator_biastype[i]  # 或 actuator_gainprm,typefrc 等
+        print(i, name, "-> joint", joint_id, joint_name)
+
+
+def print_mujoco_actuator_info2():
+    arm_joint_names = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+
+    arm_joint_ids = [
+        mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_JOINT, n) for n in arm_joint_names
+    ]
+    arm_qpos_idx = [mj_model.jnt_qposadr[jid] for jid in arm_joint_ids]
+    print("arm joint ids:", arm_joint_ids)
+    print("arm qpos idx:", arm_qpos_idx)
+
+
+# exit the code
 
 # def print_mujoco_joint_info():
 #     print("-"*80)
@@ -275,13 +297,13 @@ class CustomViewer:
         # while True:
         #     time.sleep(0.01)
 
-viewer = CustomViewer(mj_model, mj_data)
-viewer.cam.distance = 3
-viewer.cam.azimuth = 0
-viewer.cam.elevation = -30
-viewer.run_loop()
-
+# viewer = CustomViewer(mj_model, mj_data)
+# viewer.cam.distance = 3
+# viewer.cam.azimuth = 0
+# viewer.cam.elevation = -30
+# viewer.run_loop()
 
 
 # print_mujoco_q()
 # print_pinocchio_q()
+print_mujoco_actuator_info2()
