@@ -21,6 +21,7 @@ from scipy.optimize import minimize
 import os
 import numpy as np
 import pinocchio
+import yaml
 from numpy.linalg import norm, solve
 from typing import List
 from mars_rover_arm_control.utils.time_analysis import timeit
@@ -28,10 +29,54 @@ from mars_rover_arm_control.utils.print_control import control_print
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
-MODEL_PATH = os.path.join(
+
+DEFAULT_CONFIG = {
+    "simulation_dt": 0.002,
+    "control_decimation": 10,
+    "mujoco_scene_path": "",
+    "pinocchio_model_path": "",
+    "target_sphere_geom": "target_sphere",
+    "target_start": [1.15, 0.0, 0.65],
+    "target_y_min": -0.35,
+    "target_y_max": 0.35,
+    "target_y_step": 0.002,
+    "control_print_every": 5,
+    "control_start_delay": 0.0,
+    "control_ramp_time": 0.0,
+    "control_max_delta": 0.0,
+    "ik_eps": 0.01,
+    "ik_max_iters": 2000,
+    "ik_dt": 0.05,
+    "ik_damp": 0.0001,
+    "ik_lock_front_dofs": 25,
+    "qpos_len": 36,
+    "ctrl_start": 20,
+    "ctrl_end": 27,
+    "arm_start": 27,
+    "arm_end": 34,
+    "ik_joint_id": 28,
+    "cam_distance": 3,
+    "cam_azimuth": 0,
+    "cam_elevation": -30,
+}
+
+
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        return DEFAULT_CONFIG.copy()
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    cfg = DEFAULT_CONFIG.copy()
+    cfg.update({k: v for k, v in data.items() if v is not None})
+    return cfg
+
+
+CONFIG = load_config(CONFIG_FILE_PATH)
+
+MODEL_PATH = CONFIG["pinocchio_model_path"] or os.path.join(
     ROOT_DIR, "../../planetary_robot_zoo/zhurong_mars_rover_franka_emika/zhurong.xml"
 )
-SCENE_PATH = os.path.join(
+SCENE_PATH = CONFIG["mujoco_scene_path"] or os.path.join(
     ROOT_DIR, "../../planetary_robot_zoo/zhurong_mars_rover_franka_emika/scene.xml"
 )
 
@@ -39,7 +84,7 @@ SCENE_PATH = os.path.join(
 mj_model = mujoco.MjModel.from_xml_path(SCENE_PATH)
 mj_data = mujoco.MjData(mj_model)
 
-mj_model.opt.timestep = 0.002
+mj_model.opt.timestep = float(CONFIG["simulation_dt"])
 # 从 URDF 文件构建机器人模型
 pinocchio_robot = pinocchio.RobotWrapper.BuildFromMJCF(MODEL_PATH)
 # 为模型创建数据对象，用于存储计算过程中的中间结果
@@ -83,24 +128,24 @@ def pinocchio_q_to_mujoco_q(pinocchio_q):
     return mujoco_q
 
 
-@timeit(unit="ms")
+# @timeit(unit="ms")
 def inverse_arm_kinematics(current_q, target_dir, target_pos):
-    arm_idx = np.asarray(range(27, 34, 1))
+    arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
     # 指定要控制的关节 ID
-    JOINT_ID = 28  # TODO: 根据模型中的关节名称获取对应的关节 ID
+    JOINT_ID = int(CONFIG["ik_joint_id"])  # TODO: 根据模型中的关节名称获取对应的关节 ID
     # 定义期望的位姿，使用目标姿态的旋转矩阵和目标位置创建 SE3 对象
     oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
 
     # 将当前关节角度赋值给变量 q，作为迭代的初始值
     q = current_q
     # 定义收敛阈值，当误差小于该值时认为算法收敛
-    eps = 1e-2
+    eps = float(CONFIG["ik_eps"])
     # 定义最大迭代次数，防止算法陷入无限循环
-    IT_MAX = 2000
+    IT_MAX = int(CONFIG["ik_max_iters"])
     # 定义积分步长，用于更新关节角度
-    DT = 5e-2
+    DT = float(CONFIG["ik_dt"])
     # 定义阻尼因子，用于避免矩阵奇异
-    damp = 1e-4
+    damp = float(CONFIG["ik_damp"])
 
     # 初始化迭代次数为 0
     i = 0
@@ -119,7 +164,7 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
         # 判断迭代次数是否超过最大迭代次数，如果是则认为算法未收敛
         if i >= IT_MAX:
             success = False
-            print(f"inverse_kinematics failed, err = {norm(err)}")
+            # print(f"inverse_kinematics failed, err = {norm(err)}")
             break
 
         # 计算当前关节角度下的雅可比矩阵，关节速度与末端速度的映射关系
@@ -141,7 +186,7 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
         #     print(f"{i}: error = {err.T}")
         # 迭代次数加 1
         i += 1
-    print(f"IK iters: {i}, success={success}")
+    # print(f"IK iters: {i}, success={success}")
 
     # 根据算法是否收敛输出相应的信息
     # if success:
@@ -172,20 +217,20 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
 def inverse_kinematics(current_q, target_dir, target_pos):
 
     # 指定要控制的关节 ID
-    JOINT_ID = 28  # TODO: 根据模型中的关节名称获取对应的关节 ID
+    JOINT_ID = int(CONFIG["ik_joint_id"])  # TODO: 根据模型中的关节名称获取对应的关节 ID
     # 定义期望的位姿，使用目标姿态的旋转矩阵和目标位置创建 SE3 对象
     oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
 
     # 将当前关节角度赋值给变量 q，作为迭代的初始值
     q = current_q
     # 定义收敛阈值，当误差小于该值时认为算法收敛
-    eps = 1e-2
+    eps = float(CONFIG["ik_eps"])
     # 定义最大迭代次数，防止算法陷入无限循环
-    IT_MAX = 1000
+    IT_MAX = int(CONFIG["ik_max_iters"])
     # 定义积分步长，用于更新关节角度
-    DT = 5e-2
+    DT = float(CONFIG["ik_dt"])
     # 定义阻尼因子，用于避免矩阵奇异
-    damp = 1e-4
+    damp = float(CONFIG["ik_damp"])
 
     # 初始化迭代次数为 0
     i = 0
@@ -216,7 +261,7 @@ def inverse_kinematics(current_q, target_dir, target_pos):
         v = -J.T @ solve(JJt, err)
 
         # 锁死前 7 个关节：不允许它们动
-        v[:25] = 0.0
+        v[: int(CONFIG["ik_lock_front_dofs"])] = 0.0
         # 根据关节速度更新关节角度
         q = pinocchio.integrate(ph_model, q, v * DT)
 
@@ -278,8 +323,9 @@ class CustomViewer:
         #     print("Warning: Could not find the end effector with the given name.")
 
         # 初始关节角度
-        self.initial_mj_q = mj_data.qpos[:36].copy()
-        self.cur_mj_q = mj_data.qpos[:36].copy()
+        qpos_len = int(CONFIG["qpos_len"])
+        self.initial_mj_q = mj_data.qpos[:qpos_len].copy()
+        self.cur_mj_q = mj_data.qpos[:qpos_len].copy()
         print(f"Initial joint positions: {self.initial_mj_q}")
         theta = np.pi
         self.R_x = np.array(
@@ -319,34 +365,61 @@ class CustomViewer:
         ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
         target_arr = np.ctypeslib.as_array(target_shared)
 
-        x = 1.15
-        z = 0.65
-        y = 0.0
+        target_start = CONFIG["target_start"]
+        x = float(target_start[0])
+        y = float(target_start[1])
+        z = float(target_start[2])
+        y_min = float(CONFIG["target_y_min"])
+        y_max = float(CONFIG["target_y_max"])
+        y_step = float(CONFIG["target_y_step"])
         op = -1
         counter = 0
 
+        delay_s = float(CONFIG["control_start_delay"])
+        ramp_s = float(CONFIG["control_ramp_time"])
+        max_delta = float(CONFIG["control_max_delta"])
+        start_time = time.time()
+
         while run_flag.value:
+            elapsed = time.time() - start_time
+            if elapsed < delay_s:
+                ctrl_arr[:] = qpos_arr[CONFIG["arm_start"] : CONFIG["arm_end"]]
+                time.sleep(min(control_dt, delay_s - elapsed))
+                continue
             counter += 1
 
-            if y < 0.35 and y > -0.35:
-                y += 0.002 * op
-            elif y >= 0.35:
-                y = 0.34
+            if y < y_max and y > y_min:
+                y += y_step * op
+            elif y >= y_max:
+                y = y_max - 0.01
                 op = -1
-            elif y <= -0.35:
-                y = -0.34
+            elif y <= y_min:
+                y = y_min + 0.01
                 op = 1
 
             cur_mj_q = qpos_arr.copy()
             cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
             new_ph_q = inverse_arm_kinematics(cur_ph_q, self.R_x, [x, y, z])
             new_mj_q = pinocchio_q_to_mujoco_q(np.array(new_ph_q, dtype=float))
+            desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
+            cur_ctrl = ctrl_arr.copy()
 
-            ctrl_arr[:] = new_mj_q[27:34]
+            if ramp_s > 0.0:
+                ramp_alpha = min((elapsed - delay_s) / ramp_s, 1.0)
+                desired_ctrl = cur_ctrl + ramp_alpha * (desired_ctrl - cur_ctrl)
+
+            if max_delta > 0.0:
+                delta = np.clip(desired_ctrl - cur_ctrl, -max_delta, max_delta)
+                ctrl_arr[:] = cur_ctrl + delta
+            else:
+                ctrl_arr[:] = desired_ctrl
+            cur_arr = cur_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
             target_arr[:] = np.array([x, y, z], dtype=float)
 
             if counter % control_print_every == 0:
-                print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
+                # print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
+                # print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
+                print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}")
 
             time.sleep(control_dt)
 
@@ -354,11 +427,16 @@ class CustomViewer:
         step_start = time.time()
         mujoco.mj_forward(mj_model, mj_data)
         target_geom_id = mujoco.mj_name2id(
-            mj_model, mujoco.mjtObj.mjOBJ_GEOM, "target_sphere"
+            mj_model, mujoco.mjtObj.mjOBJ_GEOM, CONFIG["target_sphere_geom"]
         )
 
-        qpos_shared = mp.Array(ctypes.c_double, 36, lock=False)
-        ctrl_shared = mp.Array(ctypes.c_double, 7, lock=False)
+        qpos_len = int(CONFIG["qpos_len"])
+        ctrl_start = int(CONFIG["ctrl_start"])
+        ctrl_end = int(CONFIG["ctrl_end"])
+        ctrl_len = ctrl_end - ctrl_start
+
+        qpos_shared = mp.Array(ctypes.c_double, qpos_len, lock=False)
+        ctrl_shared = mp.Array(ctypes.c_double, ctrl_len, lock=False)
         target_shared = mp.Array(ctypes.c_double, 3, lock=False)
         run_flag = mp.Value(ctypes.c_bool, True)
 
@@ -366,12 +444,12 @@ class CustomViewer:
         ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
         target_arr = np.ctypeslib.as_array(target_shared)
 
-        qpos_arr[:] = mj_data.qpos[:36]
-        ctrl_arr[:] = mj_data.ctrl[20:27]
-        target_arr[:] = np.array([1.15, 0.0, 0.65], dtype=float)
+        qpos_arr[:] = mj_data.qpos[:qpos_len]
+        ctrl_arr[:] = mj_data.ctrl[ctrl_start:ctrl_end]
+        target_arr[:] = np.array(CONFIG["target_start"], dtype=float)
 
-        control_dt = mj_model.opt.timestep * 10
-        control_print_every = 5
+        control_dt = mj_model.opt.timestep * float(CONFIG["control_decimation"])
+        control_print_every = int(CONFIG["control_print_every"])
 
         control_process = mp.Process(
             target=self._control_worker,
@@ -389,8 +467,8 @@ class CustomViewer:
 
         try:
             while self.is_running():
-                qpos_arr[:] = mj_data.qpos[:36]
-                mj_data.ctrl[20:27] = ctrl_arr
+                qpos_arr[:] = mj_data.qpos[:qpos_len]
+                mj_data.ctrl[ctrl_start:ctrl_end] = ctrl_arr
                 mj_model.geom_pos[target_geom_id] = target_arr
 
                 mujoco.mj_step(mj_model, mj_data)
@@ -412,7 +490,7 @@ class CustomViewer:
 
 if __name__ == "__main__":
     viewer = CustomViewer(mj_model, mj_data)
-    viewer.cam.distance = 3
-    viewer.cam.azimuth = 0
-    viewer.cam.elevation = -30
+    viewer.cam.distance = float(CONFIG["cam_distance"])
+    viewer.cam.azimuth = float(CONFIG["cam_azimuth"])
+    viewer.cam.elevation = float(CONFIG["cam_elevation"])
     viewer.run_loop()
