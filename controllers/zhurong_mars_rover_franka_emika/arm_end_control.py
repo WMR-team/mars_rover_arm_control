@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     "target_y_min": -0.35,
     "target_y_max": 0.35,
     "target_y_step": 0.002,
+    "target_y_speed": 0.1,
     "control_print_every": 5,
     "control_start_delay": 0.0,
     "control_ramp_time": 0.0,
@@ -369,10 +370,6 @@ class CustomViewer:
         x = float(target_start[0])
         y = float(target_start[1])
         z = float(target_start[2])
-        y_min = float(CONFIG["target_y_min"])
-        y_max = float(CONFIG["target_y_max"])
-        y_step = float(CONFIG["target_y_step"])
-        op = -1
         counter = 0
 
         delay_s = float(CONFIG["control_start_delay"])
@@ -388,14 +385,9 @@ class CustomViewer:
                 continue
             counter += 1
 
-            if y < y_max and y > y_min:
-                y += y_step * op
-            elif y >= y_max:
-                y = y_max - 0.01
-                op = -1
-            elif y <= y_min:
-                y = y_min + 0.01
-                op = 1
+            x = float(target_arr[0])
+            y = float(target_arr[1])
+            z = float(target_arr[2])
 
             cur_mj_q = qpos_arr.copy()
             cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
@@ -414,7 +406,6 @@ class CustomViewer:
             else:
                 ctrl_arr[:] = desired_ctrl
             cur_arr = cur_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
-            target_arr[:] = np.array([x, y, z], dtype=float)
 
             if counter % control_print_every == 0:
                 # print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
@@ -448,6 +439,11 @@ class CustomViewer:
         ctrl_arr[:] = mj_data.ctrl[ctrl_start:ctrl_end]
         target_arr[:] = np.array(CONFIG["target_start"], dtype=float)
 
+        target_y_min = float(CONFIG["target_y_min"])
+        target_y_max = float(CONFIG["target_y_max"])
+        target_y_speed = float(CONFIG["target_y_speed"])
+        target_dir = -1.0
+
         control_dt = mj_model.opt.timestep * float(CONFIG["control_decimation"])
         control_print_every = int(CONFIG["control_print_every"])
 
@@ -469,6 +465,15 @@ class CustomViewer:
             while self.is_running():
                 qpos_arr[:] = mj_data.qpos[:qpos_len]
                 mj_data.ctrl[ctrl_start:ctrl_end] = ctrl_arr
+
+                target_arr[1] += target_dir * target_y_speed * mj_model.opt.timestep
+                if target_arr[1] >= target_y_max:
+                    target_arr[1] = target_y_max
+                    target_dir = -1.0
+                elif target_arr[1] <= target_y_min:
+                    target_arr[1] = target_y_min
+                    target_dir = 1.0
+
                 mj_model.geom_pos[target_geom_id] = target_arr
 
                 mujoco.mj_step(mj_model, mj_data)

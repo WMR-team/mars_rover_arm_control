@@ -24,6 +24,7 @@ target_start: [1.15, 0.0, 0.75]
 target_y_min: -0.35
 target_y_max: 0.35
 target_y_step: 0.002
+target_y_speed: 0.1
 control_print_every: 5
 control_start_delay: 5.0
 control_ramp_time: 2.0
