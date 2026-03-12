@@ -1,3 +1,16 @@
+import os
+import sys
+
+# 当前文件所在目录
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 项目根目录（根据你的层级向上走几级）
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(CURRENT_DIR, "..", "..", "..")
+)  # 自行调整级数
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
 import time
 
 import mujoco
@@ -11,6 +24,7 @@ import pinocchio
 from numpy.linalg import norm, solve
 import pinocchio_kinematic
 from typing import List
+from mars_rover_arm_control.utils.time_analysis import timeit
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
@@ -52,6 +66,7 @@ def pinocchio_q_to_mujoco_q(pinocchio_q):
     mujoco_q[3:7] = [pinocchio_q[6], pinocchio_q[3], pinocchio_q[4], pinocchio_q[5]]  # Convert (qx, qy, qz, qw) to (qw, qx, qy, qz)
     return mujoco_q
 
+@timeit(unit="ms")
 def inverse_kinematics(current_q, target_dir, target_pos):
 
     # 指定要控制的关节 ID
@@ -119,10 +134,10 @@ def inverse_kinematics(current_q, target_dir, target_pos):
     #         "Warning: the iterative algorithm has not reached convergence "
     #         "to the desired precision"
     #     )
-    if success:
-        print(f"time: {time.time()} Convergence achieved!")
-    else:
-        print(f"time: {time.time()} No!!!")
+    # if success:
+    #     print(f"time: {time.time()} Convergence achieved!")
+    # else:
+    #     print(f"time: {time.time()} No!!!")
 
     # 打印最终的关节角度和误差向量
     # print(f"\nresult: {q.flatten().tolist()}")
