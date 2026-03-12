@@ -51,6 +51,8 @@ DEFAULT_CONFIG = {
     "ik_damp": 0.0001,
     "ik_lock_front_dofs": 25,
     "ik_fail_reset_count": 5,
+    "ik_use_bounds": False,
+    "ik_bounds_max_iters": 200,
     "qpos_len": 36,
     "ctrl_start": 20,
     "ctrl_end": 27,
@@ -215,6 +217,47 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
     return q.flatten().tolist(), success
 
 
+def inverse_arm_kinematics_bounded(current_q, target_dir, target_pos):
+    arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
+    joint_id = int(CONFIG["ik_joint_id"])
+    oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
+
+    q0 = np.array(current_q, dtype=float)
+    x0 = q0[arm_idx].copy()
+
+    lower = ph_model.lowerPositionLimit[arm_idx]
+    upper = ph_model.upperPositionLimit[arm_idx]
+    bounds = []
+    for lo, hi in zip(lower, upper):
+        lo_b = None if np.isneginf(lo) else float(lo)
+        hi_b = None if np.isposinf(hi) else float(hi)
+        bounds.append((lo_b, hi_b))
+
+    def cost(x):
+        q = q0.copy()
+        q[arm_idx] = x
+        pinocchio.forwardKinematics(ph_model, ph_data, q)
+        iMd = ph_data.oMi[joint_id].actInv(oMdes)
+        err = pinocchio.log(iMd).vector
+        return float(err.T @ err)
+
+    res = minimize(
+        cost,
+        x0,
+        bounds=bounds,
+        method="L-BFGS-B",
+        options={"maxiter": int(CONFIG["ik_bounds_max_iters"])},
+    )
+
+    q = q0.copy()
+    q[arm_idx] = res.x
+    pinocchio.forwardKinematics(ph_model, ph_data, q)
+    iMd = ph_data.oMi[joint_id].actInv(oMdes)
+    err = pinocchio.log(iMd).vector
+    success = bool(res.success) and norm(err) < float(CONFIG["ik_eps"])
+    return q.flatten().tolist(), success
+
+
 @timeit(unit="ms")
 def inverse_kinematics(current_q, target_dir, target_pos):
 
@@ -330,7 +373,7 @@ class CustomViewer:
         self.cur_mj_q = mj_data.qpos[:qpos_len].copy()
         print(f"Initial joint positions: {self.initial_mj_q}")
         theta_x = 0.0  # 旋转角度，单位为弧度
-        theta_y = np.pi/2  # 旋转角度，单位为弧度
+        theta_y = np.pi / 2  # 旋转角度，单位为弧度
         self.R_x = np.array(
             [
                 [1, 0, 0],
@@ -346,7 +389,6 @@ class CustomViewer:
             ]
         )
         self.R = self.R_y @ self.R_x
-
 
         self.new_mj_q = self.initial_mj_q
 
@@ -410,7 +452,14 @@ class CustomViewer:
             else:
                 cur_ph_q = last_ik_q
 
-            new_ph_q, ik_success = inverse_arm_kinematics(cur_ph_q, self.R, [x, y, z])
+            if bool(CONFIG["ik_use_bounds"]):
+                new_ph_q, ik_success = inverse_arm_kinematics_bounded(
+                    cur_ph_q, self.R, [x, y, z]
+                )
+            else:
+                new_ph_q, ik_success = inverse_arm_kinematics(
+                    cur_ph_q, self.R, [x, y, z]
+                )
             if ik_success:
                 last_ik_q = np.array(new_ph_q, dtype=float)
                 ik_fail_count = 0

@@ -37,6 +37,8 @@ ik_dt: 0.05
 ik_damp: 0.0001
 ik_lock_front_dofs: 25
 ik_fail_reset_count: 5
+ik_use_bounds: true
+ik_bounds_max_iters: 100000
 
 # Indices and joint mapping
 qpos_len: 36
