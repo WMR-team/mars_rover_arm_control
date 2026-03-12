@@ -12,6 +12,8 @@ if PROJECT_ROOT not in sys.path:
 
 
 import time
+import multiprocessing as mp
+import ctypes
 import mujoco
 import numpy as np
 import mujoco.viewer
@@ -50,6 +52,7 @@ for i, jn in enumerate(ph_model.names):
     print(i, jn, ph_model.joints[i].nq, ph_model.joints[i].nv)
 print("-" * 80)
 
+
 def mujoco_q_to_pinocchio_q(mujoco_q):
     # Convert Mujoco joint positions to Pinocchio format
     # This is a placeholder - you need to implement the actual conversion based on your model
@@ -64,6 +67,7 @@ def mujoco_q_to_pinocchio_q(mujoco_q):
     ]  # Convert (qw, qx, qy, qz) to (qx, qy, qz, qw)
     return pinocchio_q
 
+
 def pinocchio_q_to_mujoco_q(pinocchio_q):
     # Convert Pinocchio joint positions to Mujoco format
     # This is a placeholder - you need to implement the actual conversion based on your model
@@ -77,6 +81,7 @@ def pinocchio_q_to_mujoco_q(pinocchio_q):
         pinocchio_q[5],
     ]  # Convert (qx, qy, qz, qw) to (qw, qx, qy, qz)
     return mujoco_q
+
 
 @timeit(unit="ms")
 def inverse_arm_kinematics(current_q, target_dir, target_pos):
@@ -162,6 +167,7 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
     # 返回最终的关节角度向量（以列表形式）
     return q.flatten().tolist()
 
+
 @timeit(unit="ms")
 def inverse_kinematics(current_q, target_dir, target_pos):
 
@@ -245,6 +251,7 @@ def inverse_kinematics(current_q, target_dir, target_pos):
     # 返回最终的关节角度向量（以列表形式）
     return q.flatten().tolist()
 
+
 def limit_angle(angle):
     while angle > np.pi:
         angle -= 2 * np.pi
@@ -299,68 +306,113 @@ class CustomViewer:
     def viewport(self):
         return self.handle.viewport
 
-    def run_loop(self):
-        step_start = time.time()
-        status = 0
-        # while self.is_running():
-        mujoco.mj_forward(mj_model, mj_data)
+    def _control_worker(
+        self,
+        qpos_shared,
+        ctrl_shared,
+        target_shared,
+        run_flag,
+        control_dt,
+        control_print_every,
+    ):
+        qpos_arr = np.ctypeslib.as_array(qpos_shared)
+        ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
+        target_arr = np.ctypeslib.as_array(target_shared)
+
         x = 1.15
         z = 0.65
         y = 0.0
         op = -1
         counter = 0
-        control_decimation = 10
+
+        while run_flag.value:
+            counter += 1
+
+            if y < 0.35 and y > -0.35:
+                y += 0.002 * op
+            elif y >= 0.35:
+                y = 0.34
+                op = -1
+            elif y <= -0.35:
+                y = -0.34
+                op = 1
+
+            cur_mj_q = qpos_arr.copy()
+            cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+            new_ph_q = inverse_arm_kinematics(cur_ph_q, self.R_x, [x, y, z])
+            new_mj_q = pinocchio_q_to_mujoco_q(np.array(new_ph_q, dtype=float))
+
+            ctrl_arr[:] = new_mj_q[27:34]
+            target_arr[:] = np.array([x, y, z], dtype=float)
+
+            if counter % control_print_every == 0:
+                print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
+
+            time.sleep(control_dt)
+
+    def run_loop(self):
+        step_start = time.time()
+        mujoco.mj_forward(mj_model, mj_data)
         target_geom_id = mujoco.mj_name2id(
             mj_model, mujoco.mjtObj.mjOBJ_GEOM, "target_sphere"
         )
-        while True:
 
-            counter += 1
+        qpos_shared = mp.Array(ctypes.c_double, 36, lock=False)
+        ctrl_shared = mp.Array(ctypes.c_double, 7, lock=False)
+        target_shared = mp.Array(ctypes.c_double, 3, lock=False)
+        run_flag = mp.Value(ctypes.c_bool, True)
 
-            if counter % control_decimation == 0:
-                if y < 0.35 and y > -0.35:
-                    y += 0.002 * op
-                elif y >= 0.35:
-                    y = 0.34
-                    op = -1
-                elif y <= -0.35:
-                    y = -0.34
-                    op = 1
+        qpos_arr = np.ctypeslib.as_array(qpos_shared)
+        ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
+        target_arr = np.ctypeslib.as_array(target_shared)
 
-                # for y in np.arange(-0.4, 0.4, 0.01):
-                # FIXME: 这里每次都需要再拷贝吗
-                self.cur_mj_q = mj_data.qpos[:36].copy()
-                self.cur_ph_q = mujoco_q_to_pinocchio_q(self.cur_mj_q)
-                new_ph_q = inverse_arm_kinematics(self.cur_ph_q, self.R_x, [x, y, z])
-                # new_ph_q = arm_inverse_kinematics(self.cur_ph_q, self.R_x, [x, y, z])
-                new_mj_q = pinocchio_q_to_mujoco_q(new_ph_q)
+        qpos_arr[:] = mj_data.qpos[:36]
+        ctrl_arr[:] = mj_data.ctrl[20:27]
+        target_arr[:] = np.array([1.15, 0.0, 0.65], dtype=float)
 
-                mj_data.ctrl[20:27] = new_mj_q[27:34]  # 只更新 1DoF joints 部分
-                # mj_data.qpos[27:34] = new_mj_q[27:34]  # 只更新 1DoF joints 部分
-                if counter % (control_decimation * 5) == 0:  # 每隔一段时间打印一次
-                    # print(f"newq[27:34]: {new_mj_q[27:34]}")
-                    print(f"ctrl[20:27]: {fmt_3dec(mj_data.ctrl[20:27])}")
-                    print(f"qpos[27:34]: {fmt_3dec(mj_data.qpos[27:34])}")
-                    print(
-                        f"diff: {fmt_3dec(mj_data.ctrl[20:27] - mj_data.qpos[27:34])}",
-                    )
-                mj_model.geom_pos[target_geom_id] = np.array([x, y, z], dtype=float)
-            mujoco.mj_step(mj_model, mj_data)
-            self.sync()
-            # Rudimentary time keeping, will drift relative to wall clock.
-            time_until_next_step = mj_model.opt.timestep - (time.time() - step_start)
-            if time_until_next_step > 0:
-                time.sleep(time_until_next_step)
-            # print("sync!!!!!!!!!!!!!")
-            # print(f"expected pos: {[x, float(y), z]}")
-            # time.sleep(1.0)
+        control_dt = mj_model.opt.timestep * 10
+        control_print_every = 5
+
+        control_process = mp.Process(
+            target=self._control_worker,
+            args=(
+                qpos_shared,
+                ctrl_shared,
+                target_shared,
+                run_flag,
+                control_dt,
+                control_print_every,
+            ),
+            daemon=True,
+        )
+        control_process.start()
+
+        try:
+            while self.is_running():
+                qpos_arr[:] = mj_data.qpos[:36]
+                mj_data.ctrl[20:27] = ctrl_arr
+                mj_model.geom_pos[target_geom_id] = target_arr
+
+                mujoco.mj_step(mj_model, mj_data)
+                self.sync()
+
+                time_until_next_step = mj_model.opt.timestep - (
+                    time.time() - step_start
+                )
+                if time_until_next_step > 0:
+                    time.sleep(time_until_next_step)
+                step_start = time.time()
+        finally:
+            run_flag.value = False
+            control_process.join(timeout=2.0)
 
         while True:
             time.sleep(0.01)
 
 
-viewer = CustomViewer(mj_model, mj_data)
-viewer.cam.distance = 3
-viewer.cam.azimuth = 0
-viewer.cam.elevation = -30
-viewer.run_loop()
+if __name__ == "__main__":
+    viewer = CustomViewer(mj_model, mj_data)
+    viewer.cam.distance = 3
+    viewer.cam.azimuth = 0
+    viewer.cam.elevation = -30
+    viewer.run_loop()
