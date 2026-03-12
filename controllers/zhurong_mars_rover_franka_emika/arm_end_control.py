@@ -53,6 +53,9 @@ DEFAULT_CONFIG = {
     "ik_fail_reset_count": 5,
     "ik_use_bounds": False,
     "ik_bounds_max_iters": 200,
+    "ik_retry_err_thresh": 0.2,
+    "ik_retry_attempts": 5,
+    "ik_retry_noise_scale": 0.3,
     "qpos_len": 36,
     "ctrl_start": 20,
     "ctrl_end": 27,
@@ -258,6 +261,77 @@ def inverse_arm_kinematics_bounded(current_q, target_dir, target_pos):
     return q.flatten().tolist(), success
 
 
+def inverse_arm_kinematics_bounded_retry(current_q, target_dir, target_pos):
+    arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
+    joint_id = int(CONFIG["ik_joint_id"])
+    oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
+
+    q0 = np.array(current_q, dtype=float)
+    x0 = q0[arm_idx].copy()
+
+    lower = ph_model.lowerPositionLimit[arm_idx]
+    upper = ph_model.upperPositionLimit[arm_idx]
+    bounds = []
+    for lo, hi in zip(lower, upper):
+        lo_b = None if np.isneginf(lo) else float(lo)
+        hi_b = None if np.isposinf(hi) else float(hi)
+        bounds.append((lo_b, hi_b))
+
+    def compute_err(q):
+        pinocchio.forwardKinematics(ph_model, ph_data, q)
+        iMd = ph_data.oMi[joint_id].actInv(oMdes)
+        return pinocchio.log(iMd).vector
+
+    def cost(x):
+        q = q0.copy()
+        q[arm_idx] = x
+        err = compute_err(q)
+        return float(err.T @ err)
+
+    def solve_from(x_init):
+        res = minimize(
+            cost,
+            x_init,
+            bounds=bounds,
+            method="L-BFGS-B",
+            options={"maxiter": int(CONFIG["ik_bounds_max_iters"])},
+        )
+        q = q0.copy()
+        q[arm_idx] = res.x
+        err = compute_err(q)
+        return res, q, err
+
+    base_res, base_q, base_err = solve_from(x0)
+    best_q = base_q
+    best_err = base_err
+    best_success = bool(base_res.success) and norm(base_err) < float(CONFIG["ik_eps"])
+
+    if norm(base_err) <= float(CONFIG["ik_retry_err_thresh"]):
+        return best_q.flatten().tolist(), best_success
+
+    rng = np.random.default_rng()
+    noise_scale = float(CONFIG["ik_retry_noise_scale"])
+    attempts = int(CONFIG["ik_retry_attempts"])
+
+    for _ in range(max(0, attempts)):
+        noise = rng.normal(0.0, noise_scale, size=x0.shape)
+        x_init = x0 + noise
+        # Clamp to bounds when finite.
+        for i, (lo_b, hi_b) in enumerate(bounds):
+            if lo_b is not None and x_init[i] < lo_b:
+                x_init[i] = lo_b
+            if hi_b is not None and x_init[i] > hi_b:
+                x_init[i] = hi_b
+
+        res, q, err = solve_from(x_init)
+        if norm(err) < norm(best_err):
+            best_q = q
+            best_err = err
+            best_success = bool(res.success) and norm(err) < float(CONFIG["ik_eps"])
+
+    return best_q.flatten().tolist(), best_success
+
+
 @timeit(unit="ms")
 def inverse_kinematics(current_q, target_dir, target_pos):
 
@@ -453,7 +527,7 @@ class CustomViewer:
                 cur_ph_q = last_ik_q
 
             if bool(CONFIG["ik_use_bounds"]):
-                new_ph_q, ik_success = inverse_arm_kinematics_bounded(
+                new_ph_q, ik_success = inverse_arm_kinematics_bounded_retry(
                     cur_ph_q, self.R, [x, y, z]
                 )
             else:
