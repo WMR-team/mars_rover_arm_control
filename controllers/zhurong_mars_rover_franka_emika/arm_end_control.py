@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
     "ik_dt": 0.05,
     "ik_damp": 0.0001,
     "ik_lock_front_dofs": 25,
+    "ik_fail_reset_count": 5,
     "qpos_len": 36,
     "ctrl_start": 20,
     "ctrl_end": 27,
@@ -211,7 +212,7 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
     # print(f"\nresult: {q.flatten().tolist()}")
     # print(f"\nfinal error: {err.T}")
     # 返回最终的关节角度向量（以列表形式）
-    return q.flatten().tolist()
+    return q.flatten().tolist(), success
 
 
 @timeit(unit="ms")
@@ -328,7 +329,7 @@ class CustomViewer:
         self.initial_mj_q = mj_data.qpos[:qpos_len].copy()
         self.cur_mj_q = mj_data.qpos[:qpos_len].copy()
         print(f"Initial joint positions: {self.initial_mj_q}")
-        theta = np.pi
+        theta = -np.pi
         self.R_x = np.array(
             [
                 [1, 0, 0],
@@ -377,6 +378,10 @@ class CustomViewer:
         max_delta = float(CONFIG["control_max_delta"])
         start_time = time.time()
 
+        last_ik_q = None
+        ik_fail_count = 0
+        ik_fail_reset_count = int(CONFIG["ik_fail_reset_count"])
+
         while run_flag.value:
             elapsed = time.time() - start_time
             if elapsed < delay_s:
@@ -390,8 +395,21 @@ class CustomViewer:
             z = float(target_arr[2])
 
             cur_mj_q = qpos_arr.copy()
-            cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
-            new_ph_q = inverse_arm_kinematics(cur_ph_q, self.R_x, [x, y, z])
+            if last_ik_q is None:
+                cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+            else:
+                cur_ph_q = last_ik_q
+
+            new_ph_q, ik_success = inverse_arm_kinematics(cur_ph_q, self.R_x, [x, y, z])
+            if ik_success:
+                last_ik_q = np.array(new_ph_q, dtype=float)
+                ik_fail_count = 0
+            else:
+                ik_fail_count += 1
+                if ik_fail_count >= ik_fail_reset_count:
+                    last_ik_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+                    ik_fail_count = 0
+
             new_mj_q = pinocchio_q_to_mujoco_q(np.array(new_ph_q, dtype=float))
             desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
             cur_ctrl = ctrl_arr.copy()
