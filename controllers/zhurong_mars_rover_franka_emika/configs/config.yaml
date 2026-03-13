@@ -28,7 +28,7 @@ target_y_speed: 0.1
 
 
 # type circle line_y
-trajectory_type: "heart"
+trajectory_type: "line_y"
 trajectory_center: [1.30, 0.0, 0.65]
 trajectory_scale: [0.0, 0.20, 0.20]
 trajectory_period: 16.0

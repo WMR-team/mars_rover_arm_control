@@ -26,6 +26,7 @@ from numpy.linalg import norm, solve
 from typing import List
 from mars_rover_arm_control.utils.time_analysis import timeit
 from mars_rover_arm_control.utils.print_control import control_print
+from mars_rover_arm_control.utils.fps_counter import FPSCounter
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
@@ -410,11 +411,15 @@ def _trajectory_point(t: float) -> np.ndarray:
         s = w * t
         x = scale[0] * np.cos(s)
         y = scale[1] * 2.0 * (np.sin(s) ** 3)
-        z = scale[2] / 8.0 * (
-            13.0 * np.cos(s)
-            - 5.0 * np.cos(2.0 * s)
-            - 2.0 * np.cos(3.0 * s)
-            - np.cos(4.0 * s)
+        z = (
+            scale[2]
+            / 8.0
+            * (
+                13.0 * np.cos(s)
+                - 5.0 * np.cos(2.0 * s)
+                - 2.0 * np.cos(3.0 * s)
+                - np.cos(4.0 * s)
+            )
         )
         return center + np.array([x, y, z], dtype=float)
 
@@ -562,6 +567,8 @@ class CustomViewer:
         ik_fail_count = 0
         ik_fail_reset_count = int(CONFIG["ik_fail_reset_count"])
 
+        fps = FPSCounter(print_every=control_print_every, label="control_worker")
+
         while run_flag.value:
             elapsed = time.time() - start_time
             if elapsed < delay_s:
@@ -569,6 +576,7 @@ class CustomViewer:
                 time.sleep(min(control_dt, delay_s - elapsed))
                 continue
             counter += 1
+            fps.tick()
 
             x = float(target_arr[0])
             y = float(target_arr[1])
