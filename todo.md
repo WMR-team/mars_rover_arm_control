@@ -22,3 +22,13 @@ Thanks to
 - 能顺利跟踪了，但是对于比较偏左一点，靠近机械臂极限的一个位置，机械臂的控制会很抖
 - 还是需要加一下warm strat的，有时候解算完了但是失败了还是要从上一次再开始解算
 - 要把控制线程和其他的线程来分开
+- A Holistic Approach to Reactive Mobile Manipulation
+- 可以参考上面的这个论文实现整体化控制
+- 瑞尔曼还是啥东西有官方的机械臂控制的库，看一下把这些API争取对齐到拿个东西的库的实现上
+- 库叫做robotic_arm_package
+- 夹取的时候的位姿一般是直接用grasp net确定的，确定了之后滤出来一个抓取角度大致是距离平面垂线30度左右的情况
+- 滤出来了这样的一个角度之后，实际给运动规划的时候过去的是一个轴线方向大致高0.15m(夹爪长度)左右的一个位置，然后作为夹爪的末端位姿过去
+- 有一个这个up主的[视频](https://www.bilibili.com/video/BV1CjQ2YuE6F?spm_id_from=333.788.player.switch&vd_source=63bfd19e00b68b92d8a58c82eb00a5d2&trackid=web_related_0.router-related-2479604-9kkcc.1773384689355.895)，里面的东西可以借鉴
+- 然后我现在还是先抽象出来一个API吧，先给一个指定的位姿，然后机械臂
+- 先提取一个API，然后完全是机械臂运动，机械臂自己能过去
+- 再做一个事情

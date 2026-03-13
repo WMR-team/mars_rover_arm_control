@@ -30,43 +30,6 @@ from mars_rover_arm_control.utils.print_control import control_print
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
 
-DEFAULT_CONFIG = {
-    "simulation_dt": 0.002,
-    "control_decimation": 10,
-    "mujoco_scene_path": "",
-    "pinocchio_model_path": "",
-    "target_sphere_geom": "target_sphere",
-    "target_start": [1.15, 0.0, 0.65],
-    "target_y_min": -0.35,
-    "target_y_max": 0.35,
-    "target_y_step": 0.002,
-    "target_y_speed": 0.1,
-    "control_print_every": 5,
-    "control_start_delay": 0.0,
-    "control_ramp_time": 0.0,
-    "control_max_delta": 0.0,
-    "ik_eps": 0.01,
-    "ik_max_iters": 2000,
-    "ik_dt": 0.05,
-    "ik_damp": 0.0001,
-    "ik_lock_front_dofs": 25,
-    "ik_fail_reset_count": 5,
-    "ik_use_bounds": False,
-    "ik_bounds_max_iters": 200,
-    "ik_retry_err_thresh": 0.2,
-    "ik_retry_attempts": 5,
-    "ik_retry_noise_scale": 0.3,
-    "qpos_len": 36,
-    "ctrl_start": 20,
-    "ctrl_end": 27,
-    "arm_start": 27,
-    "arm_end": 34,
-    "ik_joint_id": 28,
-    "cam_distance": 3,
-    "cam_azimuth": 0,
-    "cam_elevation": -30,
-}
-
 
 def load_config(path: str) -> dict:
     if not os.path.exists(path):
@@ -430,9 +393,81 @@ def fmt_3dec(x: np.ndarray) -> str:
     )
 
 
+def _trajectory_point(t: float) -> np.ndarray:
+    traj_type = str(CONFIG.get("trajectory_type", "line_y")).lower()
+    center = np.array(
+        CONFIG.get("trajectory_center", CONFIG["target_start"]), dtype=float
+    )
+    scale = np.array(CONFIG.get("trajectory_scale", [0.15, 0.25, 0.0]), dtype=float)
+    period = float(CONFIG.get("trajectory_period", 8.0))
+    w = 2.0 * np.pi / max(period, 1e-6)
+
+    if traj_type == "figure8":
+        # Lissajous style figure-eight in XY plane.
+        x = scale[0] * np.sin(w * t)
+        y = scale[1] * 1.6 * np.cos(w * t)
+        z = scale[2] * np.sin(2.0 * w * t)
+        return center + np.array([x, y, z], dtype=float)
+
+    if traj_type == "heart":
+        # Classic parametric heart curve in XY plane, scaled down.
+        s = w * t
+        x = scale[0] * np.cos(s)
+        y = scale[1] * 2.0 * (np.sin(s) ** 3)
+        z = scale[2] / 8.0 * (
+            13.0 * np.cos(s)
+            - 5.0 * np.cos(2.0 * s)
+            - 2.0 * np.cos(3.0 * s)
+            - np.cos(4.0 * s)
+        )
+        return center + np.array([x, y, z], dtype=float)
+
+    if traj_type == "circle":
+        s = w * t
+        x = scale[0] * np.cos(s)
+        y = scale[1] * np.cos(s)
+        z = scale[2] * np.sin(s)
+        return center + np.array([x, y, z], dtype=float)
+
+    # Default: original line sweep in Y with fixed X/Z from target_start.
+    y_min = float(CONFIG["target_y_min"])
+    y_max = float(CONFIG["target_y_max"])
+    y_speed = float(CONFIG["target_y_speed"])
+    y_span = max(y_max - y_min, 1e-6)
+    # Triangle wave 0..1..0
+    phase = (y_speed * t) / y_span
+    tri = 2.0 * np.abs(phase - np.floor(phase + 0.5))
+    y = y_min + (y_max - y_min) * tri
+    return np.array([center[0], y, center[2]], dtype=float)
+
+
+def add_visual_capsule(scene, point1, point2, radius, rgba):
+    """Adds one capsule to an mjvScene."""
+    if scene.user_scn.ngeom >= scene.user_scn.maxgeom:
+        scene.user_scn.ngeom = 0  # user_scn不会自动清除geom
+        # return
+    scene.user_scn.ngeom += 1  # increment ngeom
+    # initialise a new capsule, add it to the scene using mjv_makeConnector
+    mujoco.mjv_initGeom(
+        scene.user_scn.geoms[scene.user_scn.ngeom - 1],
+        mujoco.mjtGeom.mjGEOM_CAPSULE,
+        np.zeros(3),
+        np.zeros(3),
+        np.zeros(9),
+        rgba.astype(np.float32),
+    )
+    mujoco.mjv_connector(
+        scene.user_scn.geoms[scene.user_scn.ngeom - 1],
+        mujoco.mjtGeom.mjGEOM_CAPSULE,
+        radius,
+        point1,
+        point2,
+    )
+
+
 class CustomViewer:
     def __init__(self, mj_model, mj_data):
-        self.handle = mujoco.viewer.launch_passive(mj_model, mj_data)
+        self.viewer_handle = mujoco.viewer.launch_passive(mj_model, mj_data)
         # self.pos = 0.0001
 
         # # 找到末端执行器的 body id
@@ -467,18 +502,41 @@ class CustomViewer:
         self.new_mj_q = self.initial_mj_q
 
     def is_running(self):
-        return self.handle.is_running()
+        return self.viewer_handle.is_running()
 
     def sync(self):
-        self.handle.sync()
+        self.viewer_handle.sync()
+
+    def draw_geom(self, type, size, pos, mat, rgba):
+        self.viewer_handle.user_scn.ngeom += 1
+        geom = self.viewer_handle.user_scn.geoms[self.viewer_handle.user_scn.ngeom - 1]
+        mujoco.mjv_initGeom(geom, type, size, pos, mat, rgba)
+
+    def draw_line(self, start, end, width, rgba):
+        self.viewer_handle.user_scn.ngeom += 1
+        geom = self.viewer_handle.user_scn.geoms[self.viewer_handle.user_scn.ngeom - 1]
+        size = [0.0, 0.0, 0.0]
+        pos = [0, 0, 0]
+        mat = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE, size, pos, mat, rgba)
+        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_LINE, width, start, end)
+
+    def draw_arrow(self, start, end, width, rgba):
+        self.viewer_handle.user_scn.ngeom += 1
+        geom = self.viewer_handle.user_scn.geoms[self.viewer_handle.user_scn.ngeom - 1]
+        size = [0.0, 0.0, 0.0]
+        pos = [0, 0, 0]
+        mat = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+        mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_SPHERE, size, pos, mat, rgba)
+        mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_ARROW, width, start, end)
 
     @property
     def cam(self):
-        return self.handle.cam
+        return self.viewer_handle.cam
 
     @property
     def viewport(self):
-        return self.handle.viewport
+        return self.viewer_handle.viewport
 
     def _control_worker(
         self,
@@ -589,11 +647,17 @@ class CustomViewer:
         qpos_arr[:] = mj_data.qpos[:qpos_len]
         ctrl_arr[:] = mj_data.ctrl[ctrl_start:ctrl_end]
         target_arr[:] = np.array(CONFIG["target_start"], dtype=float)
+        traj_start_time = time.time()
 
-        target_y_min = float(CONFIG["target_y_min"])
-        target_y_max = float(CONFIG["target_y_max"])
-        target_y_speed = float(CONFIG["target_y_speed"])
-        target_dir = -1.0
+        trail_enabled = bool(CONFIG.get("trail_enabled", True))
+        trail_stride_steps = max(1, int(CONFIG.get("trail_stride_steps", 5)))
+        trail_max_points = max(0, int(CONFIG.get("trail_max_points", 1500)))
+        trail_radius = float(CONFIG.get("trail_radius", 0.01))
+        trail_rgba = np.array(
+            CONFIG.get("trail_rgba", [0.1, 0.7, 1.0, 1.0]), dtype=float
+        )
+        trail_step_counter = 0
+        target_traj = []
 
         control_dt = mj_model.opt.timestep * float(CONFIG["control_decimation"])
         control_print_every = int(CONFIG["control_print_every"])
@@ -617,15 +681,28 @@ class CustomViewer:
                 qpos_arr[:] = mj_data.qpos[:qpos_len]
                 mj_data.ctrl[ctrl_start:ctrl_end] = ctrl_arr
 
-                target_arr[1] += target_dir * target_y_speed * mj_model.opt.timestep
-                if target_arr[1] >= target_y_max:
-                    target_arr[1] = target_y_max
-                    target_dir = -1.0
-                elif target_arr[1] <= target_y_min:
-                    target_arr[1] = target_y_min
-                    target_dir = 1.0
+                t = time.time() - traj_start_time
+                target_arr[:] = _trajectory_point(t)
 
                 mj_model.geom_pos[target_geom_id] = target_arr
+
+                if trail_enabled and trail_max_points > 0:
+                    trail_step_counter += 1
+                    if trail_step_counter % trail_stride_steps == 0:
+                        target_traj.append(target_arr.copy())
+                        if len(target_traj) > trail_max_points:
+                            target_traj = target_traj[-trail_max_points:]
+
+                if trail_enabled and len(target_traj) > 1:
+                    self.viewer_handle.user_scn.ngeom = 0
+                    for i in range(len(target_traj) - 1):
+                        add_visual_capsule(
+                            self.viewer_handle,
+                            target_traj[i],
+                            target_traj[i + 1],
+                            trail_radius,
+                            trail_rgba,
+                        )
 
                 mujoco.mj_step(mj_model, mj_data)
                 self.sync()
