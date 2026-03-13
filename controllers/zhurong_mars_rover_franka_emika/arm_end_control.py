@@ -544,6 +544,8 @@ class CustomViewer:
         qpos_shared,
         ctrl_shared,
         target_shared,
+        desired_ee_shared,
+        actual_ee_shared,
         run_flag,
         control_dt,
         control_print_every,
@@ -551,6 +553,8 @@ class CustomViewer:
         qpos_arr = np.ctypeslib.as_array(qpos_shared)
         ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
         target_arr = np.ctypeslib.as_array(target_shared)
+        desired_ee_arr = np.ctypeslib.as_array(desired_ee_shared)
+        actual_ee_arr = np.ctypeslib.as_array(actual_ee_shared)
 
         target_start = CONFIG["target_start"]
         x = float(target_start[0])
@@ -609,6 +613,14 @@ class CustomViewer:
             desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
             cur_ctrl = ctrl_arr.copy()
 
+            # Update desired and actual end-effector positions for visualization.
+            joint_id = int(CONFIG["ik_joint_id"])
+            pinocchio.forwardKinematics(ph_model, ph_data, np.array(new_ph_q))
+            desired_ee_arr[:] = ph_data.oMi[joint_id].translation
+            actual_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+            pinocchio.forwardKinematics(ph_model, ph_data, actual_ph_q)
+            actual_ee_arr[:] = ph_data.oMi[joint_id].translation
+
             if ramp_s > 0.0:
                 ramp_alpha = min((elapsed - delay_s) / ramp_s, 1.0)
                 desired_ctrl = cur_ctrl + ramp_alpha * (desired_ctrl - cur_ctrl)
@@ -623,7 +635,8 @@ class CustomViewer:
             if counter % control_print_every == 0:
                 # print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
                 # print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
-                print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}")
+                # print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}")
+                pass
 
             time.sleep(control_dt)
 
@@ -642,6 +655,8 @@ class CustomViewer:
         qpos_shared = mp.Array(ctypes.c_double, qpos_len, lock=False)
         ctrl_shared = mp.Array(ctypes.c_double, ctrl_len, lock=False)
         target_shared = mp.Array(ctypes.c_double, 3, lock=False)
+        desired_ee_shared = mp.Array(ctypes.c_double, 3, lock=False)
+        actual_ee_shared = mp.Array(ctypes.c_double, 3, lock=False)
         run_flag = mp.Value(ctypes.c_bool, True)
 
         qpos_arr = np.ctypeslib.as_array(qpos_shared)
@@ -651,6 +666,10 @@ class CustomViewer:
         qpos_arr[:] = mj_data.qpos[:qpos_len]
         ctrl_arr[:] = mj_data.ctrl[ctrl_start:ctrl_end]
         target_arr[:] = np.array(CONFIG["target_start"], dtype=float)
+        desired_ee_arr = np.ctypeslib.as_array(desired_ee_shared)
+        actual_ee_arr = np.ctypeslib.as_array(actual_ee_shared)
+        desired_ee_arr[:] = target_arr
+        actual_ee_arr[:] = target_arr
         traj_start_time = time.time()
 
         trail_enabled = bool(CONFIG.get("trail_enabled", True))
@@ -663,6 +682,21 @@ class CustomViewer:
         trail_step_counter = 0
         target_traj = []
 
+        ee_trail_enabled = bool(CONFIG.get("ee_trail_enabled", True))
+        ee_trail_stride_steps = max(1, int(CONFIG.get("ee_trail_stride_steps", 5)))
+        ee_trail_max_points = max(0, int(CONFIG.get("ee_trail_max_points", 1500)))
+        ee_desired_radius = float(CONFIG.get("ee_desired_trail_radius", 0.01))
+        ee_actual_radius = float(CONFIG.get("ee_actual_trail_radius", 0.01))
+        ee_desired_rgba = np.array(
+            CONFIG.get("ee_desired_trail_rgba", [0.2, 0.9, 0.2, 1.0]), dtype=float
+        )
+        ee_actual_rgba = np.array(
+            CONFIG.get("ee_actual_trail_rgba", [1.0, 0.5, 0.1, 1.0]), dtype=float
+        )
+        ee_step_counter = 0
+        ee_desired_traj = []
+        ee_actual_traj = []
+
         control_dt = mj_model.opt.timestep * float(CONFIG["control_decimation"])
         control_print_every = int(CONFIG["control_print_every"])
 
@@ -672,6 +706,8 @@ class CustomViewer:
                 qpos_shared,
                 ctrl_shared,
                 target_shared,
+                desired_ee_shared,
+                actual_ee_shared,
                 run_flag,
                 control_dt,
                 control_print_every,
@@ -697,8 +733,23 @@ class CustomViewer:
                         if len(target_traj) > trail_max_points:
                             target_traj = target_traj[-trail_max_points:]
 
-                if trail_enabled and len(target_traj) > 1:
+                if ee_trail_enabled and ee_trail_max_points > 0:
+                    ee_step_counter += 1
+                    if ee_step_counter % ee_trail_stride_steps == 0:
+                        ee_desired_traj.append(desired_ee_arr.copy())
+                        ee_actual_traj.append(actual_ee_arr.copy())
+                        if len(ee_desired_traj) > ee_trail_max_points:
+                            ee_desired_traj = ee_desired_traj[-ee_trail_max_points:]
+                        if len(ee_actual_traj) > ee_trail_max_points:
+                            ee_actual_traj = ee_actual_traj[-ee_trail_max_points:]
+
+                if (trail_enabled and len(target_traj) > 1) or (
+                    ee_trail_enabled
+                    and (len(ee_desired_traj) > 1 or len(ee_actual_traj) > 1)
+                ):
                     self.viewer_handle.user_scn.ngeom = 0
+
+                if trail_enabled and len(target_traj) > 1:
                     for i in range(len(target_traj) - 1):
                         add_visual_capsule(
                             self.viewer_handle,
@@ -706,6 +757,26 @@ class CustomViewer:
                             target_traj[i + 1],
                             trail_radius,
                             trail_rgba,
+                        )
+
+                if ee_trail_enabled and len(ee_desired_traj) > 1:
+                    for i in range(len(ee_desired_traj) - 1):
+                        add_visual_capsule(
+                            self.viewer_handle,
+                            ee_desired_traj[i],
+                            ee_desired_traj[i + 1],
+                            ee_desired_radius,
+                            ee_desired_rgba,
+                        )
+
+                if ee_trail_enabled and len(ee_actual_traj) > 1:
+                    for i in range(len(ee_actual_traj) - 1):
+                        add_visual_capsule(
+                            self.viewer_handle,
+                            ee_actual_traj[i],
+                            ee_actual_traj[i + 1],
+                            ee_actual_radius,
+                            ee_actual_rgba,
                         )
 
                 mujoco.mj_step(mj_model, mj_data)

@@ -27,8 +27,8 @@ target_y_step: 0.002
 target_y_speed: 0.1
 
 
-# type circle line_y
-trajectory_type: "line_y"
+# type circle line_y heart
+trajectory_type: "heart"
 trajectory_center: [1.30, 0.0, 0.65]
 trajectory_scale: [0.0, 0.20, 0.20]
 trajectory_period: 16.0
@@ -39,6 +39,15 @@ trail_stride_steps: 5
 trail_max_points: 1500
 trail_radius: 0.01
 trail_rgba: [0.1, 0.7, 1.0, 1.0]
+
+# End-effector desired/actual trails (ik_joint_id)
+ee_trail_enabled: True
+ee_trail_stride_steps: 5
+ee_trail_max_points: 1500
+ee_desired_trail_radius: 0.01
+ee_actual_trail_radius: 0.01
+ee_desired_trail_rgba: [0.2, 0.9, 0.2, 1.0]
+ee_actual_trail_rgba: [1.0, 0.5, 0.1, 1.0]
 
 
 control_print_every: 5
@@ -56,9 +65,9 @@ ik_fail_reset_count: 5
 ik_use_bounds: true
 ik_bounds_max_iters: 10000
 
-ik_retry_err_thresh: 0.02
-ik_retry_attempts: 5
-ik_retry_noise_scale: 0.3
+ik_retry_err_thresh: 0.05
+ik_retry_attempts: 1
+ik_retry_noise_scale: 0.8
 
 # Indices and joint mapping
 qpos_len: 36
