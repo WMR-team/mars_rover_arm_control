@@ -26,7 +26,6 @@ target_y_max: 0.30
 target_y_step: 0.002
 target_y_speed: 0.1
 
-
 # type circle line_y heart
 trajectory_type: "heart"
 trajectory_center: [1.30, 0.0, 0.65]
@@ -49,11 +48,20 @@ ee_actual_trail_radius: 0.01
 ee_desired_trail_rgba: [0.2, 0.9, 0.2, 1.0]
 ee_actual_trail_rgba: [1.0, 0.5, 0.1, 1.0]
 
-
 control_print_every: 5
 control_start_delay: 2.0
 control_ramp_time: 1.0
 control_max_delta: 0.10
+
+# ROS1 joint state publishing (for PlotJuggler)
+ros_joint_pub_enable: False
+ros_joint_node_name: "arm_joint_state_pub"
+ros_joint_target_topic: "/arm/joint_target"
+ros_joint_actual_topic: "/arm/joint_actual"
+ros_joint_pub_hz: 50.0
+ros_joint_queue_size: 10
+# Optional joint names list (length must match arm DOFs)
+# arm_joint_names: ["arm_joint_0", "arm_joint_1", "arm_joint_2", "arm_joint_3", "arm_joint_4", "arm_joint_5", "arm_joint_6"]
 
 # IK settings
 ik_eps: 0.01

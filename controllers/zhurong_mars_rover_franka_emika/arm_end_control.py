@@ -27,6 +27,7 @@ from typing import List
 from mars_rover_arm_control.utils.time_analysis import timeit
 from mars_rover_arm_control.utils.print_control import control_print
 from mars_rover_arm_control.utils.fps_counter import FPSCounter
+from mars_rover_arm_control.utils.ros_joint_publisher import RosJointStatePublisher
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
@@ -573,6 +574,25 @@ class CustomViewer:
 
         fps = FPSCounter(print_every=control_print_every, label="control_worker")
 
+        ros_pub = None
+        if bool(CONFIG.get("ros_joint_pub_enable", False)):
+            arm_dofs = int(CONFIG["arm_end"]) - int(CONFIG["arm_start"])
+            joint_names = CONFIG.get("arm_joint_names")
+            if not joint_names:
+                joint_names = [f"arm_joint_{i}" for i in range(arm_dofs)]
+            ros_pub = RosJointStatePublisher(
+                node_name=str(CONFIG.get("ros_joint_node_name", "arm_joint_state_pub")),
+                target_topic=str(
+                    CONFIG.get("ros_joint_target_topic", "/arm/joint_target")
+                ),
+                actual_topic=str(
+                    CONFIG.get("ros_joint_actual_topic", "/arm/joint_actual")
+                ),
+                joint_names=joint_names,
+                publish_hz=float(CONFIG.get("ros_joint_pub_hz", 0.0)),
+                queue_size=int(CONFIG.get("ros_joint_queue_size", 10)),
+            )
+
         while run_flag.value:
             elapsed = time.time() - start_time
             if elapsed < delay_s:
@@ -631,6 +651,9 @@ class CustomViewer:
             else:
                 ctrl_arr[:] = desired_ctrl
             cur_arr = cur_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
+
+            if ros_pub is not None:
+                ros_pub.publish(desired_ctrl, cur_arr)
 
             if counter % control_print_every == 0:
                 # print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
