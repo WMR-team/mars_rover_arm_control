@@ -10,7 +10,7 @@ import os
 import yaml
 import mujoco.viewer
 import mujoco
-from cmd_receiver import CmdVelReceiver
+from utils.cmd_receiver import CmdVelReceiver
 
 
 class ZhurongMarsRoverControl(object):

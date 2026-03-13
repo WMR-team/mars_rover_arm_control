@@ -32,13 +32,9 @@ CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
 
 
 def load_config(path: str) -> dict:
-    if not os.path.exists(path):
-        return DEFAULT_CONFIG.copy()
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    cfg = DEFAULT_CONFIG.copy()
-    cfg.update({k: v for k, v in data.items() if v is not None})
-    return cfg
+    return data
 
 
 CONFIG = load_config(CONFIG_FILE_PATH)

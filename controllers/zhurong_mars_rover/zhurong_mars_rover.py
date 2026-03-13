@@ -75,7 +75,6 @@ class ZhurongMarsRoverControl(object):
         self.cmd_vel_msg = Twist()
         self.control_msg.data = 0
 
-        rospy.logwarn("ZhurongMarsRoverControl...READY")
 
     def set_cmd_vel(self, body_velocity_x: float, body_velocity_y: float, body_omega: float):
         # print('received!!!')
@@ -182,8 +181,6 @@ if __name__ == "__main__":
     counter = 0
     cmd_vel_receiver = None
     try:
-        import rospy  # type: ignore
-        rospy.init_node("deploy_mujoco", anonymous=True, disable_signals=True)
         cmd_vel_receiver = CmdVelReceiver(topic="/cmd_vel")
         print("[deploy_mujoco_ros1] ROS1 subscribed to: /cmd_vel")
     except Exception as e:
