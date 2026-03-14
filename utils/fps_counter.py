@@ -3,6 +3,8 @@ from collections import deque
 from functools import wraps
 from typing import Callable, Optional
 
+from mars_rover_arm_control.utils.print_control import log_and_print
+
 
 class FPSCounter:
     """
@@ -52,9 +54,9 @@ class FPSCounter:
 
         if self.print_every > 0 and self._count % self.print_every == 0:
             if fps is not None:
-                print(f"[fps_counter] {self.label}: {fps:.1f} Hz")
+                log_and_print(f"[fps_counter] {self.label}: {fps:.1f} Hz")
             else:
-                print(f"[fps_counter] {self.label}: collecting samples...")
+                log_and_print(f"[fps_counter] {self.label}: collecting samples...")
 
         return fps
 

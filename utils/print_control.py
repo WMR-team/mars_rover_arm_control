@@ -1,15 +1,76 @@
+import logging
+import os
 import sys
 from contextlib import contextmanager
+from datetime import datetime
 from functools import wraps
 from io import StringIO
 from typing import Callable, Any, Optional
+
+
+_RUN_LOGGER: Optional[logging.Logger] = None
+_RUN_LOG_PATH: Optional[str] = None
+
+
+def init_run_logger(
+    log_dir: str,
+    filename_prefix: str = "run",
+    filename_suffix: str = ".log",
+    level: int = logging.INFO,
+) -> str:
+    """
+    初始化一个只写文件的 logger，不影响原有 print。
+
+    返回值:
+        日志文件路径
+    """
+    global _RUN_LOGGER, _RUN_LOG_PATH
+
+    if _RUN_LOGGER is not None and _RUN_LOG_PATH is not None:
+        return _RUN_LOG_PATH
+
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"{filename_prefix}_{ts}{filename_suffix}")
+
+    logger = logging.getLogger("run_logger")
+    logger.setLevel(level)
+    logger.propagate = False
+
+    # Avoid duplicate handlers on repeated init.
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    _RUN_LOGGER = logger
+    _RUN_LOG_PATH = log_path
+    return log_path
+
+
+def get_run_logger() -> Optional[logging.Logger]:
+    return _RUN_LOGGER
+
+
+def log_message(message: str, level: str = "info") -> None:
+    logger = _RUN_LOGGER
+    if logger is None:
+        return
+
+    log_fn = getattr(logger, level, logger.info)
+    log_fn(message)
+
+
+def log_and_print(message: str, level: str = "info") -> None:
+    print(message)
+    log_message(message, level=level)
 
 
 @contextmanager
 def redirect_print(enable: bool = True, stream: Optional[StringIO] = None):
     """
     enable=True  时：正常打印到原来的 stdout
-    enable=False 时：把所有 print 重定向到一个 StringIO，不输出到终端   
+    enable=False 时：把所有 print 重定向到一个 StringIO，不输出到终端
     """
     if enable:
         # 不做任何事，保持原样

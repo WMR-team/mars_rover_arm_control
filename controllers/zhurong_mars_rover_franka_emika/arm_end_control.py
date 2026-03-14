@@ -9,7 +9,8 @@ PROJECT_ROOT = os.path.abspath(
 )  # 自行调整级数
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-
+# 日志目录
+LOG_ROOT = os.path.join(CURRENT_DIR, "logs")
 
 import time
 import multiprocessing as mp
@@ -24,13 +25,16 @@ import pinocchio
 import yaml
 from numpy.linalg import norm, solve
 from typing import List
-from mars_rover_arm_control.utils.time_analysis import timeit
-from mars_rover_arm_control.utils.print_control import control_print
+from mars_rover_arm_control.utils.time_analysis import timeit, warn_if_overrun
+from mars_rover_arm_control.utils.print_control import (
+    control_print,
+    init_run_logger,
+    log_and_print,
+)
 from mars_rover_arm_control.utils.fps_counter import FPSCounter
 from mars_rover_arm_control.utils.ros_joint_publisher import RosJointStatePublisher
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE_PATH = os.path.join(ROOT_DIR, "configs/config.yaml")
+CONFIG_FILE_PATH = os.path.join(CURRENT_DIR, "configs/config.yaml")
 
 
 def load_config(path: str) -> dict:
@@ -42,10 +46,10 @@ def load_config(path: str) -> dict:
 CONFIG = load_config(CONFIG_FILE_PATH)
 
 MODEL_PATH = CONFIG["pinocchio_model_path"] or os.path.join(
-    ROOT_DIR, "../../planetary_robot_zoo/zhurong_mars_rover_franka_emika/zhurong.xml"
+    CURRENT_DIR, "../../planetary_robot_zoo/zhurong_mars_rover_franka_emika/zhurong.xml"
 )
 SCENE_PATH = CONFIG["mujoco_scene_path"] or os.path.join(
-    ROOT_DIR, "../../planetary_robot_zoo/zhurong_mars_rover_franka_emika/scene.xml"
+    CURRENT_DIR, "../../planetary_robot_zoo/zhurong_mars_rover_franka_emika/scene.xml"
 )
 
 
@@ -59,11 +63,12 @@ pinocchio_robot = pinocchio.RobotWrapper.BuildFromMJCF(MODEL_PATH)
 ph_model = pinocchio_robot.model
 ph_data = pinocchio_robot.data
 
-print("-" * 80)
-print("pinocchio joints related info")
-for i, jn in enumerate(ph_model.names):
-    print(i, jn, ph_model.joints[i].nq, ph_model.joints[i].nv)
-print("-" * 80)
+def print_pinocchio_info():
+    log_and_print("-" * 80)
+    log_and_print("pinocchio joints related info")
+    for i, jn in enumerate(ph_model.names):
+        log_and_print(f"{i} {jn} {ph_model.joints[i].nq} {ph_model.joints[i].nv}")
+    log_and_print("-" * 80)
 
 
 def mujoco_q_to_pinocchio_q(mujoco_q):
@@ -369,7 +374,7 @@ def inverse_kinematics(current_q, target_dir, target_pos, control_orientation=Tr
         #     print(f"{i}: error = {err.T}")
         # 迭代次数加 1
         i += 1
-    print(f"IK iters: {i}, success={success}")
+    log_and_print(f"IK iters: {i}, success={success}")
 
     # 根据算法是否收敛输出相应的信息
     # if success:
@@ -430,10 +435,11 @@ def _trajectory_point(t: float) -> np.ndarray:
         # Classic parametric heart curve in XY plane, scaled down.
         s = w * t
         x = scale[0] * np.cos(s)
-        y = scale[1] * 2.0 * (np.sin(s) ** 3)
+        y = scale[1] * 2.0 / 1.25 * (np.sin(s) ** 3)
         z = (
             scale[2]
             / 8.0
+            / 1.25
             * (
                 13.0 * np.cos(s)
                 - 5.0 * np.cos(2.0 * s)
@@ -501,7 +507,7 @@ class CustomViewer:
         qpos_len = int(CONFIG["qpos_len"])
         self.initial_mj_q = mj_data.qpos[:qpos_len].copy()
         self.cur_mj_q = mj_data.qpos[:qpos_len].copy()
-        print(f"Initial joint positions: {self.initial_mj_q}")
+        log_and_print(f"Initial joint positions: {self.initial_mj_q}")
         theta_x = 0.0  # 旋转角度，单位为弧度
         theta_y = np.pi / 2  # 旋转角度，单位为弧度
         self.R_x = np.array(
@@ -618,69 +624,70 @@ class CustomViewer:
                 ctrl_arr[:] = qpos_arr[CONFIG["arm_start"] : CONFIG["arm_end"]]
                 time.sleep(min(control_dt, delay_s - elapsed))
                 continue
-            counter += 1
-            fps.tick()
+            with warn_if_overrun(control_dt, label="control_worker"):
+                counter += 1
+                fps.tick()
 
-            x = float(target_arr[0])
-            y = float(target_arr[1])
-            z = float(target_arr[2])
+                x = float(target_arr[0])
+                y = float(target_arr[1])
+                z = float(target_arr[2])
 
-            cur_mj_q = qpos_arr.copy()
-            if last_ik_q is None:
-                cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
-            else:
-                cur_ph_q = last_ik_q
+                cur_mj_q = qpos_arr.copy()
+                if last_ik_q is None:
+                    cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+                else:
+                    cur_ph_q = last_ik_q
 
-            control_orientation = bool(CONFIG.get("ik_control_orientation", True))
+                control_orientation = bool(CONFIG.get("ik_control_orientation", True))
 
-            if bool(CONFIG["ik_use_bounds"]):
-                new_ph_q, ik_success = inverse_arm_kinematics_bounded_retry(
-                    cur_ph_q, self.R, [x, y, z], control_orientation
-                )
-            else:
-                new_ph_q, ik_success = inverse_arm_kinematics(
-                    cur_ph_q, self.R, [x, y, z], control_orientation
-                )
-            if ik_success:
-                last_ik_q = np.array(new_ph_q, dtype=float)
-                ik_fail_count = 0
-            else:
-                ik_fail_count += 1
-                if ik_fail_count >= ik_fail_reset_count:
-                    last_ik_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+                if bool(CONFIG["ik_use_bounds"]):
+                    new_ph_q, ik_success = inverse_arm_kinematics_bounded_retry(
+                        cur_ph_q, self.R, [x, y, z], control_orientation
+                    )
+                else:
+                    new_ph_q, ik_success = inverse_arm_kinematics(
+                        cur_ph_q, self.R, [x, y, z], control_orientation
+                    )
+                if ik_success:
+                    last_ik_q = np.array(new_ph_q, dtype=float)
                     ik_fail_count = 0
+                else:
+                    ik_fail_count += 1
+                    if ik_fail_count >= ik_fail_reset_count:
+                        last_ik_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+                        ik_fail_count = 0
 
-            new_mj_q = pinocchio_q_to_mujoco_q(np.array(new_ph_q, dtype=float))
-            desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
-            cur_ctrl = ctrl_arr.copy()
+                new_mj_q = pinocchio_q_to_mujoco_q(np.array(new_ph_q, dtype=float))
+                desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
+                cur_ctrl = ctrl_arr.copy()
 
-            # Update desired and actual end-effector positions for visualization.
-            joint_id = int(CONFIG["ik_joint_id"])
-            pinocchio.forwardKinematics(ph_model, ph_data, np.array(new_ph_q))
-            desired_ee_arr[:] = ph_data.oMi[joint_id].translation
-            actual_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
-            pinocchio.forwardKinematics(ph_model, ph_data, actual_ph_q)
-            actual_ee_arr[:] = ph_data.oMi[joint_id].translation
+                # Update desired and actual end-effector positions for visualization.
+                joint_id = int(CONFIG["ik_joint_id"])
+                pinocchio.forwardKinematics(ph_model, ph_data, np.array(new_ph_q))
+                desired_ee_arr[:] = ph_data.oMi[joint_id].translation
+                actual_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
+                pinocchio.forwardKinematics(ph_model, ph_data, actual_ph_q)
+                actual_ee_arr[:] = ph_data.oMi[joint_id].translation
 
-            if ramp_s > 0.0:
-                ramp_alpha = min((elapsed - delay_s) / ramp_s, 1.0)
-                desired_ctrl = cur_ctrl + ramp_alpha * (desired_ctrl - cur_ctrl)
+                if ramp_s > 0.0:
+                    ramp_alpha = min((elapsed - delay_s) / ramp_s, 1.0)
+                    desired_ctrl = cur_ctrl + ramp_alpha * (desired_ctrl - cur_ctrl)
 
-            if max_delta > 0.0:
-                delta = np.clip(desired_ctrl - cur_ctrl, -max_delta, max_delta)
-                ctrl_arr[:] = cur_ctrl + delta
-            else:
-                ctrl_arr[:] = desired_ctrl
-            cur_arr = cur_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
+                if max_delta > 0.0:
+                    delta = np.clip(desired_ctrl - cur_ctrl, -max_delta, max_delta)
+                    ctrl_arr[:] = cur_ctrl + delta
+                else:
+                    ctrl_arr[:] = desired_ctrl
+                cur_arr = cur_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
 
-            if ros_pub is not None:
-                ros_pub.publish(desired_ctrl, cur_arr)
+                if ros_pub is not None:
+                    ros_pub.publish(desired_ctrl, cur_arr)
 
-            if counter % control_print_every == 0:
-                print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
-                print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
-                print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}")
-                pass
+                if counter % control_print_every == 0:
+                    log_and_print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
+                    log_and_print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
+                    log_and_print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}, total_diff = {np.linalg.norm(ctrl_arr - cur_arr):.4f}")
+                    pass
 
             time.sleep(control_dt)
 
@@ -841,6 +848,9 @@ class CustomViewer:
 
 
 if __name__ == "__main__":
+    log_path = init_run_logger(LOG_ROOT, "arm_end_control")
+    log_and_print(f"[logger] logging to {log_path}")
+    print_pinocchio_info()
     viewer = CustomViewer(mj_model, mj_data)
     viewer.cam.distance = float(CONFIG["cam_distance"])
     viewer.cam.azimuth = float(CONFIG["cam_azimuth"])

@@ -7,7 +7,7 @@ simulation_duration: 600.0
 # Simulation time step
 simulation_dt: 0.002
 # Controller update frequency (simulation_dt * control_decimation)
-control_decimation: 10
+control_decimation: 5
 
 # MuJoCo actuator interpretation:
 # - anymal_c.xml uses <position ...> actuators, so `ctrl` is a joint position target (radians).
@@ -27,7 +27,7 @@ target_y_step: 0.002
 target_y_speed: 0.1
 
 # type circle line_y heart
-trajectory_type: "heart"
+trajectory_type: "circle"
 trajectory_center: [1.35, 0.0, 0.65]
 trajectory_scale: [0.0, 0.20, 0.20]
 trajectory_period: 32.0
@@ -35,14 +35,14 @@ trajectory_period: 32.0
 # trail the traj
 trail_enabled: True
 trail_stride_steps: 5
-trail_max_points: 1500
-trail_radius: 0.01
+trail_max_points: 400
+trail_radius: 0.005
 trail_rgba: [0.1, 0.7, 1.0, 1.0]
 
 # End-effector desired/actual trails (ik_joint_id)
 ee_trail_enabled: True
 ee_trail_stride_steps: 5
-ee_trail_max_points: 1500
+ee_trail_max_points: 400
 ee_desired_trail_radius: 0.01
 ee_actual_trail_radius: 0.01
 ee_desired_trail_rgba: [0.2, 0.9, 0.2, 1.0]
@@ -50,8 +50,8 @@ ee_actual_trail_rgba: [1.0, 0.5, 0.1, 1.0]
 
 control_print_every: 5
 control_start_delay: 2.0
-control_ramp_time: 0.1
-control_max_delta: 0.2
+control_ramp_time: 0.0
+control_max_delta: 0.0
 
 # ROS1 joint state publishing (for PlotJuggler)
 ros_joint_pub_enable: False
@@ -66,7 +66,7 @@ ros_joint_queue_size: 10
 # IK settings
 ik_eps: 0.01
 ik_max_iters: 10000
-ik_dt: 0.05
+ik_dt: 0.01
 ik_damp: 0.0001
 ik_control_orientation: True
 ik_lock_front_dofs: 25
@@ -76,7 +76,7 @@ ik_bounds_max_iters: 10000
 
 ik_retry_err_thresh: 0.05
 ik_retry_attempts: 1
-ik_retry_noise_scale: 0.8
+ik_retry_noise_scale: 0.3
 
 # Indices and joint mapping
 qpos_len: 36
