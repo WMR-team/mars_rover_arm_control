@@ -28,9 +28,9 @@ target_y_speed: 0.1
 
 # type circle line_y heart
 trajectory_type: "heart"
-trajectory_center: [1.30, 0.0, 0.65]
+trajectory_center: [1.35, 0.0, 0.65]
 trajectory_scale: [0.0, 0.20, 0.20]
-trajectory_period: 16.0
+trajectory_period: 32.0
 
 # trail the traj
 trail_enabled: True
@@ -50,8 +50,8 @@ ee_actual_trail_rgba: [1.0, 0.5, 0.1, 1.0]
 
 control_print_every: 5
 control_start_delay: 2.0
-control_ramp_time: 1.0
-control_max_delta: 0.10
+control_ramp_time: 0.1
+control_max_delta: 0.2
 
 # ROS1 joint state publishing (for PlotJuggler)
 ros_joint_pub_enable: False
@@ -68,6 +68,7 @@ ik_eps: 0.01
 ik_max_iters: 10000
 ik_dt: 0.05
 ik_damp: 0.0001
+ik_control_orientation: True
 ik_lock_front_dofs: 25
 ik_fail_reset_count: 5
 ik_use_bounds: true

@@ -97,7 +97,7 @@ def pinocchio_q_to_mujoco_q(pinocchio_q):
 
 
 # @timeit(unit="ms")
-def inverse_arm_kinematics(current_q, target_dir, target_pos):
+def inverse_arm_kinematics(current_q, target_dir, target_pos, control_orientation=True):
     arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
     # 指定要控制的关节 ID
     JOINT_ID = int(CONFIG["ik_joint_id"])  # TODO: 根据模型中的关节名称获取对应的关节 ID
@@ -124,6 +124,8 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
         iMd = ph_data.oMi[JOINT_ID].actInv(oMdes)
         # 通过李群对数映射将变换矩阵转换为 6 维误差向量（包含位置误差和方向误差），用于量化当前位姿与目标位姿的差异
         err = pinocchio.log(iMd).vector
+        if not control_orientation:
+            err[3:] = 0.0
 
         # 判断误差是否小于收敛阈值，如果是则认为算法收敛
         if norm(err) < eps:
@@ -139,6 +141,8 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
         J_full = pinocchio.computeJointJacobian(ph_model, ph_data, q, JOINT_ID)
         # 对雅可比矩阵进行变换，转换到李代数空间，以匹配误差向量的坐标系，同时取反以调整误差方向
         J = -pinocchio.Jlog6(iMd.inverse()) @ J_full
+        if not control_orientation:
+            J[3:, :] = 0.0
 
         J_arm = J[:, arm_idx]
         v_arm = -J_arm.T @ solve(J_arm @ J_arm.T + damp * np.eye(6), err)
@@ -181,7 +185,9 @@ def inverse_arm_kinematics(current_q, target_dir, target_pos):
     return q.flatten().tolist(), success
 
 
-def inverse_arm_kinematics_bounded(current_q, target_dir, target_pos):
+def inverse_arm_kinematics_bounded(
+    current_q, target_dir, target_pos, control_orientation=True
+):
     arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
     joint_id = int(CONFIG["ik_joint_id"])
     oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
@@ -203,6 +209,8 @@ def inverse_arm_kinematics_bounded(current_q, target_dir, target_pos):
         pinocchio.forwardKinematics(ph_model, ph_data, q)
         iMd = ph_data.oMi[joint_id].actInv(oMdes)
         err = pinocchio.log(iMd).vector
+        if not control_orientation:
+            err[3:] = 0.0
         return float(err.T @ err)
 
     res = minimize(
@@ -218,11 +226,15 @@ def inverse_arm_kinematics_bounded(current_q, target_dir, target_pos):
     pinocchio.forwardKinematics(ph_model, ph_data, q)
     iMd = ph_data.oMi[joint_id].actInv(oMdes)
     err = pinocchio.log(iMd).vector
+    if not control_orientation:
+        err[3:] = 0.0
     success = bool(res.success) and norm(err) < float(CONFIG["ik_eps"])
     return q.flatten().tolist(), success
 
 
-def inverse_arm_kinematics_bounded_retry(current_q, target_dir, target_pos):
+def inverse_arm_kinematics_bounded_retry(
+    current_q, target_dir, target_pos, control_orientation=True
+):
     arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
     joint_id = int(CONFIG["ik_joint_id"])
     oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
@@ -241,7 +253,10 @@ def inverse_arm_kinematics_bounded_retry(current_q, target_dir, target_pos):
     def compute_err(q):
         pinocchio.forwardKinematics(ph_model, ph_data, q)
         iMd = ph_data.oMi[joint_id].actInv(oMdes)
-        return pinocchio.log(iMd).vector
+        err = pinocchio.log(iMd).vector
+        if not control_orientation:
+            err[3:] = 0.0
+        return err
 
     def cost(x):
         q = q0.copy()
@@ -294,7 +309,7 @@ def inverse_arm_kinematics_bounded_retry(current_q, target_dir, target_pos):
 
 
 @timeit(unit="ms")
-def inverse_kinematics(current_q, target_dir, target_pos):
+def inverse_kinematics(current_q, target_dir, target_pos, control_orientation=True):
 
     # 指定要控制的关节 ID
     JOINT_ID = int(CONFIG["ik_joint_id"])  # TODO: 根据模型中的关节名称获取对应的关节 ID
@@ -321,6 +336,8 @@ def inverse_kinematics(current_q, target_dir, target_pos):
         iMd = ph_data.oMi[JOINT_ID].actInv(oMdes)
         # 通过李群对数映射将变换矩阵转换为 6 维误差向量（包含位置误差和方向误差），用于量化当前位姿与目标位姿的差异
         err = pinocchio.log(iMd).vector
+        if not control_orientation:
+            err[3:] = 0.0
 
         # 判断误差是否小于收敛阈值，如果是则认为算法收敛
         if norm(err) < eps:
@@ -335,6 +352,8 @@ def inverse_kinematics(current_q, target_dir, target_pos):
         J = pinocchio.computeJointJacobian(ph_model, ph_data, q, JOINT_ID)
         # 对雅可比矩阵进行变换，转换到李代数空间，以匹配误差向量的坐标系，同时取反以调整误差方向
         J = -np.dot(pinocchio.Jlog6(iMd.inverse()), J)
+        if not control_orientation:
+            J[3:, :] = 0.0
         # 使用阻尼最小二乘法求解关节速度
         # v = -J.T.dot(solve(J.dot(J.T) + damp * np.eye(6), err))
         JJt = J.dot(J.T) + damp * np.eye(6)
@@ -612,13 +631,15 @@ class CustomViewer:
             else:
                 cur_ph_q = last_ik_q
 
+            control_orientation = bool(CONFIG.get("ik_control_orientation", True))
+
             if bool(CONFIG["ik_use_bounds"]):
                 new_ph_q, ik_success = inverse_arm_kinematics_bounded_retry(
-                    cur_ph_q, self.R, [x, y, z]
+                    cur_ph_q, self.R, [x, y, z], control_orientation
                 )
             else:
                 new_ph_q, ik_success = inverse_arm_kinematics(
-                    cur_ph_q, self.R, [x, y, z]
+                    cur_ph_q, self.R, [x, y, z], control_orientation
                 )
             if ik_success:
                 last_ik_q = np.array(new_ph_q, dtype=float)
@@ -656,9 +677,9 @@ class CustomViewer:
                 ros_pub.publish(desired_ctrl, cur_arr)
 
             if counter % control_print_every == 0:
-                # print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
-                # print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
-                # print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}")
+                print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
+                print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
+                print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}")
                 pass
 
             time.sleep(control_dt)
