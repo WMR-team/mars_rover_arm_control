@@ -19,7 +19,7 @@ def init_run_logger(
     level: int = logging.INFO,
 ) -> str:
     """
-    初始化一个只写文件的 logger，不影响原有 print。
+    初始化一个只写文件的 logger, 不影响原有 print。
 
     返回值:
         日志文件路径

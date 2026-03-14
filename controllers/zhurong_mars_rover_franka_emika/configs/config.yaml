@@ -9,6 +9,27 @@ simulation_dt: 0.002
 # Controller update frequency (simulation_dt * control_decimation)
 control_decimation: 5
 
+# Thread frequencies (Hz)
+sim_hz: 500.0
+control_hz: 100.0
+view_hz: 60.0
+vision_hz: 10.0
+
+# Thread stats
+thread_stat_print_every: 200
+thread_overrun_warn: True
+
+# Run selected tasks in subprocesses
+vision_use_process: True
+
+# Vision (MuJoCo camera)
+vision_camera_name: "obsZED"
+vision_width: 640
+vision_height: 480
+vision_save_enable: True
+vision_save_every: 10
+vision_save_dir: "logs/vision"
+
 # MuJoCo actuator interpretation:
 # - anymal_c.xml uses <position ...> actuators, so `ctrl` is a joint position target (radians).
 # - for robots using <motor ...> actuators, set this to "torque".
@@ -52,6 +73,29 @@ control_print_every: 5
 control_start_delay: 2.0
 control_ramp_time: 0.0
 control_max_delta: 0.0
+
+# Arm init pose (world frame) and workspace bounds (relative to base_link)
+arm_init_pos: [1.2, 0.0, 0.6]
+arm_init_quat: [1.0, 0.0, 0.0, 0.0]
+arm_workspace_min: [-0.6, -0.6, 0.0]
+arm_workspace_max: [0.8, 0.6, 1.0]
+arm_traj_step: 0.02
+
+# Rover/base settings
+arm_base_body: "base_link"
+base_wheel_ctrl_start: 0
+base_wheel_ctrl_count: 6
+base_steer_ctrl_start: 12
+base_steer_ctrl_count: 6
+base_half_width: 0.652
+base_half_length: 0.775
+base_wheel_radius: 0.15
+base_max_speed: 0.3
+base_max_omega: 0.6
+base_kp_lin: 1.2
+base_kp_ang: 1.5
+base_goal_tolerance: 0.05
+base_traj_step: 0.05
 
 # ROS1 joint state publishing (for PlotJuggler)
 ros_joint_pub_enable: False

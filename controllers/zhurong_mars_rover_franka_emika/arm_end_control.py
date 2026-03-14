@@ -1,4 +1,7 @@
 import os
+import threading
+import time
+from dataclasses import dataclass
 import sys
 
 # 当前文件所在目录
@@ -12,18 +15,11 @@ if PROJECT_ROOT not in sys.path:
 # 日志目录
 LOG_ROOT = os.path.join(CURRENT_DIR, "logs")
 
-import time
-import multiprocessing as mp
-import ctypes
 import mujoco
 import numpy as np
 import mujoco.viewer
-from scipy.optimize import minimize
-import os
-import numpy as np
 import pinocchio
 import yaml
-from numpy.linalg import norm, solve
 from typing import List
 from mars_rover_arm_control.utils.time_analysis import timeit, warn_if_overrun
 from mars_rover_arm_control.utils.print_control import (
@@ -31,8 +27,25 @@ from mars_rover_arm_control.utils.print_control import (
     init_run_logger,
     log_and_print,
 )
+from mars_rover_arm_control.utils.arm_kinematics_utils import (
+    print_pinocchio_info,
+    mujoco_q_to_pinocchio_q,
+    pinocchio_q_to_mujoco_q,
+    inverse_arm_kinematics,
+    inverse_arm_kinematics_bounded,
+    inverse_arm_kinematics_bounded_retry,
+    inverse_kinematics,
+)
 from mars_rover_arm_control.utils.fps_counter import FPSCounter
 from mars_rover_arm_control.utils.ros_joint_publisher import RosJointStatePublisher
+from mars_rover_arm_control.utils.thread_pool import ThreadPool
+from mars_rover_arm_control.utils.trajectory_utils import trajectory_point
+from mars_rover_arm_control.controllers.zhurong_mars_rover_franka_emika.control_api import (
+    ArmController,
+    ArmKinematics,
+    RoverController,
+    TaskCoordinator,
+)
 
 CONFIG_FILE_PATH = os.path.join(CURRENT_DIR, "configs/config.yaml")
 
@@ -63,409 +76,25 @@ pinocchio_robot = pinocchio.RobotWrapper.BuildFromMJCF(MODEL_PATH)
 ph_model = pinocchio_robot.model
 ph_data = pinocchio_robot.data
 
-def print_pinocchio_info():
-    log_and_print("-" * 80)
-    log_and_print("pinocchio joints related info")
-    for i, jn in enumerate(ph_model.names):
-        log_and_print(f"{i} {jn} {ph_model.joints[i].nq} {ph_model.joints[i].nv}")
-    log_and_print("-" * 80)
 
-
-def mujoco_q_to_pinocchio_q(mujoco_q):
-    # Convert Mujoco joint positions to Pinocchio format
-    # This is a placeholder - you need to implement the actual conversion based on your model
-    # MJ: [x, y, z, qw, qx, qy, qz]
-    # Pin: [x, y, z, qx, qy, qz, qw]
-    pinocchio_q = mujoco_q.copy()
-    pinocchio_q[3:7] = [
-        mujoco_q[4],
-        mujoco_q[5],
-        mujoco_q[6],
-        mujoco_q[3],
-    ]  # Convert (qw, qx, qy, qz) to (qx, qy, qz, qw)
-    return pinocchio_q
-
-
-def pinocchio_q_to_mujoco_q(pinocchio_q):
-    # Convert Pinocchio joint positions to Mujoco format
-    # This is a placeholder - you need to implement the actual conversion based on your model
-    # MJ: [x, y, z, qw, qx, qy, qz]
-    # Pin: [x, y, z, qx, qy, qz, qw]
-    mujoco_q = pinocchio_q.copy()
-    mujoco_q[3:7] = [
-        pinocchio_q[6],
-        pinocchio_q[3],
-        pinocchio_q[4],
-        pinocchio_q[5],
-    ]  # Convert (qx, qy, qz, qw) to (qw, qx, qy, qz)
-    return mujoco_q
-
-
-# @timeit(unit="ms")
-def inverse_arm_kinematics(current_q, target_dir, target_pos, control_orientation=True):
-    arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
-    # 指定要控制的关节 ID
-    JOINT_ID = int(CONFIG["ik_joint_id"])  # TODO: 根据模型中的关节名称获取对应的关节 ID
-    # 定义期望的位姿，使用目标姿态的旋转矩阵和目标位置创建 SE3 对象
-    oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
-
-    # 将当前关节角度赋值给变量 q，作为迭代的初始值
-    q = current_q
-    # 定义收敛阈值，当误差小于该值时认为算法收敛
-    eps = float(CONFIG["ik_eps"])
-    # 定义最大迭代次数，防止算法陷入无限循环
-    IT_MAX = int(CONFIG["ik_max_iters"])
-    # 定义积分步长，用于更新关节角度
-    DT = float(CONFIG["ik_dt"])
-    # 定义阻尼因子，用于避免矩阵奇异
-    damp = float(CONFIG["ik_damp"])
-
-    # 初始化迭代次数为 0
-    i = 0
-    while True:
-        # 进行正运动学计算，得到当前关节角度下机器人各关节的位置和姿态
-        pinocchio.forwardKinematics(ph_model, ph_data, q)
-        # 计算目标位姿到当前位姿之间的变换
-        iMd = ph_data.oMi[JOINT_ID].actInv(oMdes)
-        # 通过李群对数映射将变换矩阵转换为 6 维误差向量（包含位置误差和方向误差），用于量化当前位姿与目标位姿的差异
-        err = pinocchio.log(iMd).vector
-        if not control_orientation:
-            err[3:] = 0.0
-
-        # 判断误差是否小于收敛阈值，如果是则认为算法收敛
-        if norm(err) < eps:
-            success = True
-            break
-        # 判断迭代次数是否超过最大迭代次数，如果是则认为算法未收敛
-        if i >= IT_MAX:
-            success = False
-            # print(f"inverse_kinematics failed, err = {norm(err)}")
-            break
-
-        # 计算当前关节角度下的雅可比矩阵，关节速度与末端速度的映射关系
-        J_full = pinocchio.computeJointJacobian(ph_model, ph_data, q, JOINT_ID)
-        # 对雅可比矩阵进行变换，转换到李代数空间，以匹配误差向量的坐标系，同时取反以调整误差方向
-        J = -pinocchio.Jlog6(iMd.inverse()) @ J_full
-        if not control_orientation:
-            J[3:, :] = 0.0
-
-        J_arm = J[:, arm_idx]
-        v_arm = -J_arm.T @ solve(J_arm @ J_arm.T + damp * np.eye(6), err)
-
-        v = np.zeros(ph_model.nv)
-        v[arm_idx] = v_arm
-
-        # 根据关节速度更新关节角度
-        q = pinocchio.integrate(ph_model, q, v * DT)
-
-        # # 每迭代 300 次打印一次当前的误差信息
-        # if not i % 1000:
-        #     print(f"{i}: error = {err.T}")
-        # 迭代次数加 1
-        i += 1
-    # print(f"IK iters: {i}, success={success}")
-
-    # 根据算法是否收敛输出相应的信息
-    # if success:
-    #     print("Convergence achieved!")
-    #     for name, oMi in zip(ph_model.names, ph_data.oMi):
-    #         print(
-    #             "{:<24} : {: .2f} {: .2f} {: .2f}".format(name, *oMi.translation.T.flat)
-    #         )
-    # else:
-    #     print(
-    #         "\n"
-    #         "Warning: the iterative algorithm has not reached convergence "
-    #         "to the desired precision"
-    #     )
-    # if success:
-    #     print(f"time: {time.time()} Convergence achieved!")
-    # else:
-    #     print(f"time: {time.time()} No!!!")
-
-    # 打印最终的关节角度和误差向量
-    # print(f"\nresult: {q.flatten().tolist()}")
-    # print(f"\nfinal error: {err.T}")
-    # 返回最终的关节角度向量（以列表形式）
-    return q.flatten().tolist(), success
-
-
-def inverse_arm_kinematics_bounded(
-    current_q, target_dir, target_pos, control_orientation=True
-):
-    arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
-    joint_id = int(CONFIG["ik_joint_id"])
-    oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
-
-    q0 = np.array(current_q, dtype=float)
-    x0 = q0[arm_idx].copy()
-
-    lower = ph_model.lowerPositionLimit[arm_idx]
-    upper = ph_model.upperPositionLimit[arm_idx]
-    bounds = []
-    for lo, hi in zip(lower, upper):
-        lo_b = None if np.isneginf(lo) else float(lo)
-        hi_b = None if np.isposinf(hi) else float(hi)
-        bounds.append((lo_b, hi_b))
-
-    def cost(x):
-        q = q0.copy()
-        q[arm_idx] = x
-        pinocchio.forwardKinematics(ph_model, ph_data, q)
-        iMd = ph_data.oMi[joint_id].actInv(oMdes)
-        err = pinocchio.log(iMd).vector
-        if not control_orientation:
-            err[3:] = 0.0
-        return float(err.T @ err)
-
-    res = minimize(
-        cost,
-        x0,
-        bounds=bounds,
-        method="L-BFGS-B",
-        options={"maxiter": int(CONFIG["ik_bounds_max_iters"])},
-    )
-
-    q = q0.copy()
-    q[arm_idx] = res.x
-    pinocchio.forwardKinematics(ph_model, ph_data, q)
-    iMd = ph_data.oMi[joint_id].actInv(oMdes)
-    err = pinocchio.log(iMd).vector
-    if not control_orientation:
-        err[3:] = 0.0
-    success = bool(res.success) and norm(err) < float(CONFIG["ik_eps"])
-    return q.flatten().tolist(), success
-
-
-def inverse_arm_kinematics_bounded_retry(
-    current_q, target_dir, target_pos, control_orientation=True
-):
-    arm_idx = np.asarray(range(CONFIG["arm_start"], CONFIG["arm_end"], 1))
-    joint_id = int(CONFIG["ik_joint_id"])
-    oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
-
-    q0 = np.array(current_q, dtype=float)
-    x0 = q0[arm_idx].copy()
-
-    lower = ph_model.lowerPositionLimit[arm_idx]
-    upper = ph_model.upperPositionLimit[arm_idx]
-    bounds = []
-    for lo, hi in zip(lower, upper):
-        lo_b = None if np.isneginf(lo) else float(lo)
-        hi_b = None if np.isposinf(hi) else float(hi)
-        bounds.append((lo_b, hi_b))
-
-    def compute_err(q):
-        pinocchio.forwardKinematics(ph_model, ph_data, q)
-        iMd = ph_data.oMi[joint_id].actInv(oMdes)
-        err = pinocchio.log(iMd).vector
-        if not control_orientation:
-            err[3:] = 0.0
-        return err
-
-    def cost(x):
-        q = q0.copy()
-        q[arm_idx] = x
-        err = compute_err(q)
-        return float(err.T @ err)
-
-    def solve_from(x_init):
-        res = minimize(
-            cost,
-            x_init,
-            bounds=bounds,
-            method="L-BFGS-B",
-            options={"maxiter": int(CONFIG["ik_bounds_max_iters"])},
-        )
-        q = q0.copy()
-        q[arm_idx] = res.x
-        err = compute_err(q)
-        return res, q, err
-
-    base_res, base_q, base_err = solve_from(x0)
-    best_q = base_q
-    best_err = base_err
-    best_success = bool(base_res.success) and norm(base_err) < float(CONFIG["ik_eps"])
-
-    if norm(base_err) <= float(CONFIG["ik_retry_err_thresh"]):
-        return best_q.flatten().tolist(), best_success
-
-    rng = np.random.default_rng()
-    noise_scale = float(CONFIG["ik_retry_noise_scale"])
-    attempts = int(CONFIG["ik_retry_attempts"])
-
-    for _ in range(max(0, attempts)):
-        noise = rng.normal(0.0, noise_scale, size=x0.shape)
-        x_init = x0 + noise
-        # Clamp to bounds when finite.
-        for i, (lo_b, hi_b) in enumerate(bounds):
-            if lo_b is not None and x_init[i] < lo_b:
-                x_init[i] = lo_b
-            if hi_b is not None and x_init[i] > hi_b:
-                x_init[i] = hi_b
-
-        res, q, err = solve_from(x_init)
-        if norm(err) < norm(best_err):
-            best_q = q
-            best_err = err
-            best_success = bool(res.success) and norm(err) < float(CONFIG["ik_eps"])
-
-    return best_q.flatten().tolist(), best_success
-
-
-@timeit(unit="ms")
-def inverse_kinematics(current_q, target_dir, target_pos, control_orientation=True):
-
-    # 指定要控制的关节 ID
-    JOINT_ID = int(CONFIG["ik_joint_id"])  # TODO: 根据模型中的关节名称获取对应的关节 ID
-    # 定义期望的位姿，使用目标姿态的旋转矩阵和目标位置创建 SE3 对象
-    oMdes = pinocchio.SE3(target_dir, np.array(target_pos))
-
-    # 将当前关节角度赋值给变量 q，作为迭代的初始值
-    q = current_q
-    # 定义收敛阈值，当误差小于该值时认为算法收敛
-    eps = float(CONFIG["ik_eps"])
-    # 定义最大迭代次数，防止算法陷入无限循环
-    IT_MAX = int(CONFIG["ik_max_iters"])
-    # 定义积分步长，用于更新关节角度
-    DT = float(CONFIG["ik_dt"])
-    # 定义阻尼因子，用于避免矩阵奇异
-    damp = float(CONFIG["ik_damp"])
-
-    # 初始化迭代次数为 0
-    i = 0
-    while True:
-        # 进行正运动学计算，得到当前关节角度下机器人各关节的位置和姿态
-        pinocchio.forwardKinematics(ph_model, ph_data, q)
-        # 计算目标位姿到当前位姿之间的变换
-        iMd = ph_data.oMi[JOINT_ID].actInv(oMdes)
-        # 通过李群对数映射将变换矩阵转换为 6 维误差向量（包含位置误差和方向误差），用于量化当前位姿与目标位姿的差异
-        err = pinocchio.log(iMd).vector
-        if not control_orientation:
-            err[3:] = 0.0
-
-        # 判断误差是否小于收敛阈值，如果是则认为算法收敛
-        if norm(err) < eps:
-            success = True
-            break
-        # 判断迭代次数是否超过最大迭代次数，如果是则认为算法未收敛
-        if i >= IT_MAX:
-            success = False
-            break
-
-        # 计算当前关节角度下的雅可比矩阵，关节速度与末端速度的映射关系
-        J = pinocchio.computeJointJacobian(ph_model, ph_data, q, JOINT_ID)
-        # 对雅可比矩阵进行变换，转换到李代数空间，以匹配误差向量的坐标系，同时取反以调整误差方向
-        J = -np.dot(pinocchio.Jlog6(iMd.inverse()), J)
-        if not control_orientation:
-            J[3:, :] = 0.0
-        # 使用阻尼最小二乘法求解关节速度
-        # v = -J.T.dot(solve(J.dot(J.T) + damp * np.eye(6), err))
-        JJt = J.dot(J.T) + damp * np.eye(6)
-        v = -J.T @ solve(JJt, err)
-
-        # 锁死前 7 个关节：不允许它们动
-        v[: int(CONFIG["ik_lock_front_dofs"])] = 0.0
-        # 根据关节速度更新关节角度
-        q = pinocchio.integrate(ph_model, q, v * DT)
-
-        # # 每迭代 300 次打印一次当前的误差信息
-        # if not i % 1000:
-        #     print(f"{i}: error = {err.T}")
-        # 迭代次数加 1
-        i += 1
-    log_and_print(f"IK iters: {i}, success={success}")
-
-    # 根据算法是否收敛输出相应的信息
-    # if success:
-    #     print("Convergence achieved!")
-    #     for name, oMi in zip(ph_model.names, ph_data.oMi):
-    #         print(
-    #             "{:<24} : {: .2f} {: .2f} {: .2f}".format(name, *oMi.translation.T.flat)
-    #         )
-    # else:
-    #     print(
-    #         "\n"
-    #         "Warning: the iterative algorithm has not reached convergence "
-    #         "to the desired precision"
-    #     )
-    # if success:
-    #     print(f"time: {time.time()} Convergence achieved!")
-    # else:
-    #     print(f"time: {time.time()} No!!!")
-
-    # 打印最终的关节角度和误差向量
-    # print(f"\nresult: {q.flatten().tolist()}")
-    # print(f"\nfinal error: {err.T}")
-    # 返回最终的关节角度向量（以列表形式）
-    return q.flatten().tolist()
-
-
-def limit_angle(angle):
-    while angle > np.pi:
-        angle -= 2 * np.pi
-    while angle < -np.pi:
-        angle += 2 * np.pi
-    return angle
+@dataclass
+class SharedState:
+    lock: threading.Lock
+    current_qpos: np.ndarray
+    desired_ctrl: np.ndarray
+    desired_ee: np.ndarray
+    actual_ee: np.ndarray
+    target_pos: np.ndarray
+    rover_wheel_cmd: np.ndarray
+    rover_steer_cmd: np.ndarray
+    base_pos: np.ndarray
+    base_yaw: float
 
 
 def fmt_3dec(x: np.ndarray) -> str:
     return np.array2string(
         x, formatter={"float_kind": lambda v: f"{v: .3f}"}, separator=" "
     )
-
-
-def _trajectory_point(t: float) -> np.ndarray:
-    traj_type = str(CONFIG.get("trajectory_type", "line_y")).lower()
-    center = np.array(
-        CONFIG.get("trajectory_center", CONFIG["target_start"]), dtype=float
-    )
-    scale = np.array(CONFIG.get("trajectory_scale", [0.15, 0.25, 0.0]), dtype=float)
-    period = float(CONFIG.get("trajectory_period", 8.0))
-    w = 2.0 * np.pi / max(period, 1e-6)
-
-    if traj_type == "figure8":
-        # Lissajous style figure-eight in XY plane.
-        x = scale[0] * np.sin(w * t)
-        y = scale[1] * 1.6 * np.cos(w * t)
-        z = scale[2] * np.sin(2.0 * w * t)
-        return center + np.array([x, y, z], dtype=float)
-
-    if traj_type == "heart":
-        # Classic parametric heart curve in XY plane, scaled down.
-        s = w * t
-        x = scale[0] * np.cos(s)
-        y = scale[1] * 2.0 / 1.25 * (np.sin(s) ** 3)
-        z = (
-            scale[2]
-            / 8.0
-            / 1.25
-            * (
-                13.0 * np.cos(s)
-                - 5.0 * np.cos(2.0 * s)
-                - 2.0 * np.cos(3.0 * s)
-                - np.cos(4.0 * s)
-            )
-        )
-        return center + np.array([x, y, z], dtype=float)
-
-    if traj_type == "circle":
-        s = w * t
-        x = scale[0] * np.cos(s)
-        y = scale[1] * np.cos(s)
-        z = scale[2] * np.sin(s)
-        return center + np.array([x, y, z], dtype=float)
-
-    # Default: original line sweep in Y with fixed X/Z from target_start.
-    y_min = float(CONFIG["target_y_min"])
-    y_max = float(CONFIG["target_y_max"])
-    y_speed = float(CONFIG["target_y_speed"])
-    y_span = max(y_max - y_min, 1e-6)
-    # Triangle wave 0..1..0
-    phase = (y_speed * t) / y_span
-    tri = 2.0 * np.abs(phase - np.floor(phase + 0.5))
-    y = y_min + (y_max - y_min) * tri
-    return np.array([center[0], y, center[2]], dtype=float)
 
 
 def add_visual_capsule(scene, point1, point2, radius, rgba):
@@ -565,292 +194,583 @@ class CustomViewer:
     def viewport(self):
         return self.viewer_handle.viewport
 
-    def _control_worker(
-        self,
-        qpos_shared,
-        ctrl_shared,
-        target_shared,
-        desired_ee_shared,
-        actual_ee_shared,
-        run_flag,
-        control_dt,
-        control_print_every,
-    ):
-        qpos_arr = np.ctypeslib.as_array(qpos_shared)
-        ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
-        target_arr = np.ctypeslib.as_array(target_shared)
-        desired_ee_arr = np.ctypeslib.as_array(desired_ee_shared)
-        actual_ee_arr = np.ctypeslib.as_array(actual_ee_shared)
-
-        target_start = CONFIG["target_start"]
-        x = float(target_start[0])
-        y = float(target_start[1])
-        z = float(target_start[2])
-        counter = 0
-
-        delay_s = float(CONFIG["control_start_delay"])
-        ramp_s = float(CONFIG["control_ramp_time"])
-        max_delta = float(CONFIG["control_max_delta"])
-        start_time = time.time()
-
-        last_ik_q = None
-        ik_fail_count = 0
-        ik_fail_reset_count = int(CONFIG["ik_fail_reset_count"])
-
-        fps = FPSCounter(print_every=control_print_every, label="control_worker")
-
-        ros_pub = None
-        if bool(CONFIG.get("ros_joint_pub_enable", False)):
-            arm_dofs = int(CONFIG["arm_end"]) - int(CONFIG["arm_start"])
-            joint_names = CONFIG.get("arm_joint_names")
-            if not joint_names:
-                joint_names = [f"arm_joint_{i}" for i in range(arm_dofs)]
-            ros_pub = RosJointStatePublisher(
-                node_name=str(CONFIG.get("ros_joint_node_name", "arm_joint_state_pub")),
-                target_topic=str(
-                    CONFIG.get("ros_joint_target_topic", "/arm/joint_target")
-                ),
-                actual_topic=str(
-                    CONFIG.get("ros_joint_actual_topic", "/arm/joint_actual")
-                ),
-                joint_names=joint_names,
-                publish_hz=float(CONFIG.get("ros_joint_pub_hz", 0.0)),
-                queue_size=int(CONFIG.get("ros_joint_queue_size", 10)),
-            )
-
-        while run_flag.value:
-            elapsed = time.time() - start_time
-            if elapsed < delay_s:
-                ctrl_arr[:] = qpos_arr[CONFIG["arm_start"] : CONFIG["arm_end"]]
-                time.sleep(min(control_dt, delay_s - elapsed))
-                continue
-            with warn_if_overrun(control_dt, label="control_worker"):
-                counter += 1
-                fps.tick()
-
-                x = float(target_arr[0])
-                y = float(target_arr[1])
-                z = float(target_arr[2])
-
-                cur_mj_q = qpos_arr.copy()
-                if last_ik_q is None:
-                    cur_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
-                else:
-                    cur_ph_q = last_ik_q
-
-                control_orientation = bool(CONFIG.get("ik_control_orientation", True))
-
-                if bool(CONFIG["ik_use_bounds"]):
-                    new_ph_q, ik_success = inverse_arm_kinematics_bounded_retry(
-                        cur_ph_q, self.R, [x, y, z], control_orientation
-                    )
-                else:
-                    new_ph_q, ik_success = inverse_arm_kinematics(
-                        cur_ph_q, self.R, [x, y, z], control_orientation
-                    )
-                if ik_success:
-                    last_ik_q = np.array(new_ph_q, dtype=float)
-                    ik_fail_count = 0
-                else:
-                    ik_fail_count += 1
-                    if ik_fail_count >= ik_fail_reset_count:
-                        last_ik_q = mujoco_q_to_pinocchio_q(cur_mj_q)
-                        ik_fail_count = 0
-
-                new_mj_q = pinocchio_q_to_mujoco_q(np.array(new_ph_q, dtype=float))
-                desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
-                cur_ctrl = ctrl_arr.copy()
-
-                # Update desired and actual end-effector positions for visualization.
-                joint_id = int(CONFIG["ik_joint_id"])
-                pinocchio.forwardKinematics(ph_model, ph_data, np.array(new_ph_q))
-                desired_ee_arr[:] = ph_data.oMi[joint_id].translation
-                actual_ph_q = mujoco_q_to_pinocchio_q(cur_mj_q)
-                pinocchio.forwardKinematics(ph_model, ph_data, actual_ph_q)
-                actual_ee_arr[:] = ph_data.oMi[joint_id].translation
-
-                if ramp_s > 0.0:
-                    ramp_alpha = min((elapsed - delay_s) / ramp_s, 1.0)
-                    desired_ctrl = cur_ctrl + ramp_alpha * (desired_ctrl - cur_ctrl)
-
-                if max_delta > 0.0:
-                    delta = np.clip(desired_ctrl - cur_ctrl, -max_delta, max_delta)
-                    ctrl_arr[:] = cur_ctrl + delta
-                else:
-                    ctrl_arr[:] = desired_ctrl
-                cur_arr = cur_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
-
-                if ros_pub is not None:
-                    ros_pub.publish(desired_ctrl, cur_arr)
-
-                if counter % control_print_every == 0:
-                    log_and_print(f"ctrl[0:7]: {fmt_3dec(ctrl_arr)}")
-                    log_and_print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
-                    log_and_print(f"diff[0:7]: {fmt_3dec(ctrl_arr - cur_arr)}, total_diff = {np.linalg.norm(ctrl_arr - cur_arr):.4f}")
-                    pass
-
-            time.sleep(control_dt)
-
-    def run_loop(self):
-        step_start = time.time()
+    def _init_ids(self):
         mujoco.mj_forward(mj_model, mj_data)
         target_geom_id = mujoco.mj_name2id(
             mj_model, mujoco.mjtObj.mjOBJ_GEOM, CONFIG["target_sphere_geom"]
         )
+        base_body_id = mujoco.mj_name2id(
+            mj_model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            str(CONFIG.get("arm_base_body", "base_link")),
+        )
+        return target_geom_id, base_body_id
 
+    def _init_trail_state(self):
+        trail_state = {
+            "trail_enabled": bool(CONFIG.get("trail_enabled", True)),
+            "trail_stride_steps": max(1, int(CONFIG.get("trail_stride_steps", 5))),
+            "trail_max_points": max(0, int(CONFIG.get("trail_max_points", 1500))),
+            "trail_radius": float(CONFIG.get("trail_radius", 0.01)),
+            "trail_rgba": np.array(
+                CONFIG.get("trail_rgba", [0.1, 0.7, 1.0, 1.0]), dtype=float
+            ),
+            "trail_step_counter": 0,
+            "target_traj": [],
+            "ee_trail_enabled": bool(CONFIG.get("ee_trail_enabled", True)),
+            "ee_trail_stride_steps": max(
+                1, int(CONFIG.get("ee_trail_stride_steps", 5))
+            ),
+            "ee_trail_max_points": max(0, int(CONFIG.get("ee_trail_max_points", 1500))),
+            "ee_desired_radius": float(CONFIG.get("ee_desired_trail_radius", 0.01)),
+            "ee_actual_radius": float(CONFIG.get("ee_actual_trail_radius", 0.01)),
+            "ee_desired_rgba": np.array(
+                CONFIG.get("ee_desired_trail_rgba", [0.2, 0.9, 0.2, 1.0]),
+                dtype=float,
+            ),
+            "ee_actual_rgba": np.array(
+                CONFIG.get("ee_actual_trail_rgba", [1.0, 0.5, 0.1, 1.0]),
+                dtype=float,
+            ),
+            "ee_step_counter": 0,
+            "ee_desired_traj": [],
+            "ee_actual_traj": [],
+        }
+        return trail_state
+
+    def _read_thread_config(self):
+        sim_hz = float(CONFIG.get("sim_hz", 1.0 / mj_model.opt.timestep))
+        control_hz = float(
+            CONFIG.get(
+                "control_hz",
+                1.0 / (mj_model.opt.timestep * float(CONFIG["control_decimation"])),
+            )
+        )
+        view_hz = float(CONFIG.get("view_hz", 60.0))
+        vision_hz = float(CONFIG.get("vision_hz", 0.0))
+        stat_print_every = int(CONFIG.get("thread_stat_print_every", 200))
+        overrun_warn = bool(CONFIG.get("thread_overrun_warn", True))
+        vision_use_process = bool(CONFIG.get("vision_use_process", False))
+        vision_camera_name = str(CONFIG.get("vision_camera_name", ""))
+        vision_width = int(CONFIG.get("vision_width", 640))
+        vision_height = int(CONFIG.get("vision_height", 480))
+        vision_save_enable = bool(CONFIG.get("vision_save_enable", False))
+        vision_save_every = int(CONFIG.get("vision_save_every", 10))
+        vision_save_dir = str(CONFIG.get("vision_save_dir", "logs/vision"))
+        if not os.path.isabs(vision_save_dir):
+            vision_save_dir = os.path.join(PROJECT_ROOT, vision_save_dir)
+        if vision_save_enable:
+            os.makedirs(vision_save_dir, exist_ok=True)
+
+        return {
+            "sim_hz": sim_hz,
+            "control_hz": control_hz,
+            "view_hz": view_hz,
+            "vision_hz": vision_hz,
+            "stat_print_every": stat_print_every,
+            "overrun_warn": overrun_warn,
+            "vision_use_process": vision_use_process,
+            "vision_camera_name": vision_camera_name,
+            "vision_width": vision_width,
+            "vision_height": vision_height,
+            "vision_save_enable": vision_save_enable,
+            "vision_save_every": vision_save_every,
+            "vision_save_dir": vision_save_dir,
+        }
+
+    def _init_controllers(self):
+        arm_kin = ArmKinematics(ph_model, ph_data, CONFIG)
+        arm_ctrl = ArmController(arm_kin, CONFIG, self.R)
+        rover_ctrl = RoverController(CONFIG)
+        task = TaskCoordinator(arm_ctrl, rover_ctrl, CONFIG)
+        return arm_kin, arm_ctrl, rover_ctrl, task
+
+    def _init_shared_state(self, qpos_len, arm_len, base_body_id, arm_kin):
+        if base_body_id >= 0:
+            base_pos_init = mj_data.xpos[base_body_id].copy()
+            base_rot = mj_data.xmat[base_body_id].reshape(3, 3)
+            base_yaw_init = float(np.arctan2(base_rot[1, 0], base_rot[0, 0]))
+        else:
+            base_pos_init = np.zeros(3, dtype=float)
+            base_yaw_init = 0.0
+
+        init_qpos = mj_data.qpos[:qpos_len].copy()
+        init_actual_ee = arm_kin.ee_position(arm_kin.mujoco_q_to_pinocchio_q(init_qpos))
+
+        shared = SharedState(
+            lock=threading.Lock(),
+            current_qpos=init_qpos,
+            desired_ctrl=np.zeros(arm_len, dtype=float),
+            desired_ee=np.array(CONFIG["target_start"], dtype=float),
+            actual_ee=init_actual_ee,
+            target_pos=np.array(CONFIG["target_start"], dtype=float),
+            rover_wheel_cmd=np.zeros(6, dtype=float),
+            rover_steer_cmd=np.zeros(6, dtype=float),
+            base_pos=base_pos_init,
+            base_yaw=base_yaw_init,
+        )
+        return shared
+
+    def _init_ros_pub(self):
+        if not bool(CONFIG.get("ros_joint_pub_enable", False)):
+            return None
+        arm_dofs = int(CONFIG["arm_end"]) - int(CONFIG["arm_start"])
+        joint_names = CONFIG.get("arm_joint_names")
+        if not joint_names:
+            joint_names = [f"arm_joint_{i}" for i in range(arm_dofs)]
+        return RosJointStatePublisher(
+            node_name=str(CONFIG.get("ros_joint_node_name", "arm_joint_state_pub")),
+            target_topic=str(CONFIG.get("ros_joint_target_topic", "/arm/joint_target")),
+            actual_topic=str(CONFIG.get("ros_joint_actual_topic", "/arm/joint_actual")),
+            joint_names=joint_names,
+            publish_hz=float(CONFIG.get("ros_joint_pub_hz", 0.0)),
+            queue_size=int(CONFIG.get("ros_joint_queue_size", 10)),
+        )
+
+    def _build_control_step(
+        self,
+        shared,
+        rover_ctrl,
+        task,
+        arm_ctrl,
+        control_hz,
+        control_print_every,
+        ros_pub,
+        control_state,
+    ):
+        def control_step() -> None:
+            if control_state["stop_event"].is_set():
+                return
+
+            t = time.perf_counter() - control_state["start_time"]
+            desired_target = trajectory_point(CONFIG, t)
+            with shared.lock:
+                current_qpos = shared.current_qpos.copy()
+                base_pos = shared.base_pos.copy()
+                base_yaw = shared.base_yaw
+
+            rover_ctrl.update_base_pose(base_pos, base_yaw)
+            with warn_if_overrun(1.0 / max(control_hz, 1e-6), label="control_thread"):
+                control_state["fps"].tick()
+                task.update(desired_target, current_qpos)
+                new_mj_q, desired_ee = arm_ctrl.step(current_qpos)
+
+            desired_ctrl = new_mj_q[CONFIG["arm_start"] : CONFIG["arm_end"]]
+            rover_ctrl.step()
+            wheel_cmd, steer_cmd = rover_ctrl.get_cmd()
+
+            with shared.lock:
+                shared.desired_ctrl[:] = desired_ctrl
+                shared.desired_ee[:] = desired_ee
+                shared.target_pos[:] = desired_target
+                shared.rover_wheel_cmd[:] = wheel_cmd
+                shared.rover_steer_cmd[:] = steer_cmd
+
+            cur_arr = current_qpos[CONFIG["arm_start"] : CONFIG["arm_end"]]
+            if ros_pub is not None:
+                ros_pub.publish(desired_ctrl, cur_arr)
+
+            control_state["counter"] += 1
+            if control_state["counter"] % control_print_every == 0:
+                diff = desired_ctrl - cur_arr
+                log_and_print(f"ctrl[0:7]: {fmt_3dec(desired_ctrl)}")
+                log_and_print(f"cur [0:7]: {fmt_3dec(cur_arr)}")
+                log_and_print(
+                    "diff[0:7]: "
+                    f"{fmt_3dec(diff)}, total_diff = {np.linalg.norm(diff):.4f}"
+                )
+
+        return control_step
+
+    def _build_sim_step(
+        self,
+        shared,
+        sim_lock,
+        target_geom_id,
+        base_body_id,
+        arm_kin,
+        qpos_len,
+        ctrl_start,
+        ctrl_end,
+        delay_s,
+        ramp_s,
+        max_delta,
+        sim_state,
+    ):
+        def sim_step() -> None:
+            if sim_state["stop_event"].is_set():
+                return
+
+            elapsed = time.perf_counter() - sim_state["start_time"]
+            with shared.lock:
+                desired_ctrl = shared.desired_ctrl.copy()
+                rover_wheel_cmd = shared.rover_wheel_cmd.copy()
+                rover_steer_cmd = shared.rover_steer_cmd.copy()
+                target_pos = shared.target_pos.copy()
+
+            with sim_lock:
+                mj_model.geom_pos[target_geom_id] = target_pos
+
+                if elapsed < delay_s:
+                    mj_data.ctrl[ctrl_start:ctrl_end] = mj_data.qpos[
+                        CONFIG["arm_start"] : CONFIG["arm_end"]
+                    ]
+                else:
+                    cur_ctrl = mj_data.ctrl[ctrl_start:ctrl_end].copy()
+                    if ramp_s > 0.0:
+                        ramp_alpha = min((elapsed - delay_s) / ramp_s, 1.0)
+                        desired_ctrl = cur_ctrl + ramp_alpha * (desired_ctrl - cur_ctrl)
+
+                    if max_delta > 0.0:
+                        delta = np.clip(desired_ctrl - cur_ctrl, -max_delta, max_delta)
+                        mj_data.ctrl[ctrl_start:ctrl_end] = cur_ctrl + delta
+                    else:
+                        mj_data.ctrl[ctrl_start:ctrl_end] = desired_ctrl
+
+                mj_data.ctrl[
+                    int(CONFIG["base_steer_ctrl_start"]) : int(
+                        CONFIG["base_steer_ctrl_start"]
+                    )
+                    + 6
+                ] = rover_steer_cmd
+                mj_data.ctrl[
+                    int(CONFIG["base_wheel_ctrl_start"]) : int(
+                        CONFIG["base_wheel_ctrl_start"]
+                    )
+                    + 6
+                ] = rover_wheel_cmd
+
+                mujoco.mj_step(mj_model, mj_data)
+
+                qpos_copy = mj_data.qpos[:qpos_len].copy()
+                actual_ph_q = arm_kin.mujoco_q_to_pinocchio_q(qpos_copy)
+                actual_ee = arm_kin.ee_position(actual_ph_q)
+
+                if base_body_id >= 0:
+                    base_pos = mj_data.xpos[base_body_id].copy()
+                    rot = mj_data.xmat[base_body_id].reshape(3, 3)
+                    base_yaw = float(np.arctan2(rot[1, 0], rot[0, 0]))
+                else:
+                    base_pos = np.zeros(3, dtype=float)
+                    base_yaw = 0.0
+
+            with shared.lock:
+                shared.current_qpos[:] = qpos_copy
+                shared.actual_ee[:] = actual_ee
+                shared.base_pos[:] = base_pos
+                shared.base_yaw = base_yaw
+
+        return sim_step
+
+    def _build_vision_step(self, sim_lock, vision_state, vision_cfg):
+        def vision_step() -> None:
+            if vision_state["stop_event"].is_set():
+                return
+            if vision_state["renderer"] is None:
+                vision_state["renderer"] = mujoco.Renderer(
+                    mj_model,
+                    width=vision_cfg["vision_width"],
+                    height=vision_cfg["vision_height"],
+                )
+            with sim_lock:
+                if vision_cfg["vision_camera_name"]:
+                    vision_state["renderer"].update_scene(
+                        mj_data, camera=vision_cfg["vision_camera_name"]
+                    )
+                else:
+                    vision_state["renderer"].update_scene(mj_data)
+                frame = vision_state["renderer"].render()
+
+            vision_state["frame_idx"] += 1
+            if (
+                vision_cfg["vision_save_enable"]
+                and vision_cfg["vision_save_every"] > 0
+                and vision_state["frame_idx"] % vision_cfg["vision_save_every"] == 0
+            ):
+                file_path = os.path.join(
+                    vision_cfg["vision_save_dir"],
+                    f"frame_{vision_state['frame_idx']:06d}.png",
+                )
+                try:
+                    import imageio.v3 as iio  # type: ignore
+
+                    iio.imwrite(file_path, frame)
+                except Exception:
+                    try:
+                        from PIL import Image  # type: ignore
+
+                        Image.fromarray(frame).save(file_path)
+                    except Exception:
+                        if not vision_state["warned_no_writer"]:
+                            log_and_print(
+                                "[vision] image writer unavailable, install imageio or pillow"
+                            )
+                            vision_state["warned_no_writer"] = True
+
+        return vision_step
+
+    def _run_view_loop(
+        self,
+        shared,
+        sim_lock,
+        trail_state,
+        view_hz,
+        stat_print_every,
+        stop_event,
+    ):
+        view_period = 1.0 / max(view_hz, 1e-6)
+        next_view = time.perf_counter()
+        view_fps = FPSCounter(print_every=0, label="view")
+        view_counter = 0
+        view_overruns = 0
+
+        while self.is_running():
+            now = time.perf_counter()
+            if now < next_view:
+                time.sleep(max(0.0, next_view - now))
+                continue
+            next_view += view_period
+            loop_start = time.perf_counter()
+
+            with shared.lock:
+                target_pos = shared.target_pos.copy()
+                desired_ee = shared.desired_ee.copy()
+                actual_ee = shared.actual_ee.copy()
+
+            if trail_state["trail_enabled"] and trail_state["trail_max_points"] > 0:
+                trail_state["trail_step_counter"] += 1
+                if (
+                    trail_state["trail_step_counter"]
+                    % trail_state["trail_stride_steps"]
+                    == 0
+                ):
+                    trail_state["target_traj"].append(target_pos.copy())
+                    if (
+                        len(trail_state["target_traj"])
+                        > trail_state["trail_max_points"]
+                    ):
+                        trail_state["target_traj"] = trail_state["target_traj"][
+                            -trail_state["trail_max_points"] :
+                        ]
+
+            if (
+                trail_state["ee_trail_enabled"]
+                and trail_state["ee_trail_max_points"] > 0
+            ):
+                trail_state["ee_step_counter"] += 1
+                if (
+                    trail_state["ee_step_counter"]
+                    % trail_state["ee_trail_stride_steps"]
+                    == 0
+                ):
+                    trail_state["ee_desired_traj"].append(desired_ee.copy())
+                    trail_state["ee_actual_traj"].append(actual_ee.copy())
+                    if (
+                        len(trail_state["ee_desired_traj"])
+                        > trail_state["ee_trail_max_points"]
+                    ):
+                        trail_state["ee_desired_traj"] = trail_state["ee_desired_traj"][
+                            -trail_state["ee_trail_max_points"] :
+                        ]
+                    if (
+                        len(trail_state["ee_actual_traj"])
+                        > trail_state["ee_trail_max_points"]
+                    ):
+                        trail_state["ee_actual_traj"] = trail_state["ee_actual_traj"][
+                            -trail_state["ee_trail_max_points"] :
+                        ]
+
+            if (
+                trail_state["trail_enabled"] and len(trail_state["target_traj"]) > 1
+            ) or (
+                trail_state["ee_trail_enabled"]
+                and (
+                    len(trail_state["ee_desired_traj"]) > 1
+                    or len(trail_state["ee_actual_traj"]) > 1
+                )
+            ):
+                self.viewer_handle.user_scn.ngeom = 0
+
+            if trail_state["trail_enabled"] and len(trail_state["target_traj"]) > 1:
+                for i in range(len(trail_state["target_traj"]) - 1):
+                    add_visual_capsule(
+                        self.viewer_handle,
+                        trail_state["target_traj"][i],
+                        trail_state["target_traj"][i + 1],
+                        trail_state["trail_radius"],
+                        trail_state["trail_rgba"],
+                    )
+
+            if (
+                trail_state["ee_trail_enabled"]
+                and len(trail_state["ee_desired_traj"]) > 1
+            ):
+                for i in range(len(trail_state["ee_desired_traj"]) - 1):
+                    add_visual_capsule(
+                        self.viewer_handle,
+                        trail_state["ee_desired_traj"][i],
+                        trail_state["ee_desired_traj"][i + 1],
+                        trail_state["ee_desired_radius"],
+                        trail_state["ee_desired_rgba"],
+                    )
+
+            if (
+                trail_state["ee_trail_enabled"]
+                and len(trail_state["ee_actual_traj"]) > 1
+            ):
+                for i in range(len(trail_state["ee_actual_traj"]) - 1):
+                    add_visual_capsule(
+                        self.viewer_handle,
+                        trail_state["ee_actual_traj"][i],
+                        trail_state["ee_actual_traj"][i + 1],
+                        trail_state["ee_actual_radius"],
+                        trail_state["ee_actual_rgba"],
+                    )
+
+            with sim_lock:
+                self.sync()
+
+            loop_elapsed = time.perf_counter() - loop_start
+            view_fps.tick()
+            view_counter += 1
+            if view_period > 0 and loop_elapsed > view_period:
+                view_overruns += 1
+            if stat_print_every > 0 and view_counter % stat_print_every == 0:
+                actual = view_fps.fps()
+                if actual is None:
+                    actual_str = "n/a"
+                else:
+                    actual_str = f"{actual:.1f}"
+                log_and_print(
+                    f"[thread_stats] view: actual {actual_str} Hz / "
+                    f"target {view_hz:.1f} Hz / overruns {view_overruns}"
+                )
+
+        stop_event.set()
+
+    def run_loop(self):
+        target_geom_id, base_body_id = self._init_ids()
         qpos_len = int(CONFIG["qpos_len"])
         ctrl_start = int(CONFIG["ctrl_start"])
         ctrl_end = int(CONFIG["ctrl_end"])
-        ctrl_len = ctrl_end - ctrl_start
+        arm_len = int(CONFIG["arm_end"]) - int(CONFIG["arm_start"])
 
-        qpos_shared = mp.Array(ctypes.c_double, qpos_len, lock=False)
-        ctrl_shared = mp.Array(ctypes.c_double, ctrl_len, lock=False)
-        target_shared = mp.Array(ctypes.c_double, 3, lock=False)
-        desired_ee_shared = mp.Array(ctypes.c_double, 3, lock=False)
-        actual_ee_shared = mp.Array(ctypes.c_double, 3, lock=False)
-        run_flag = mp.Value(ctypes.c_bool, True)
+        trail_state = self._init_trail_state()
+        thread_cfg = self._read_thread_config()
 
-        qpos_arr = np.ctypeslib.as_array(qpos_shared)
-        ctrl_arr = np.ctypeslib.as_array(ctrl_shared)
-        target_arr = np.ctypeslib.as_array(target_shared)
-
-        qpos_arr[:] = mj_data.qpos[:qpos_len]
-        ctrl_arr[:] = mj_data.ctrl[ctrl_start:ctrl_end]
-        target_arr[:] = np.array(CONFIG["target_start"], dtype=float)
-        desired_ee_arr = np.ctypeslib.as_array(desired_ee_shared)
-        actual_ee_arr = np.ctypeslib.as_array(actual_ee_shared)
-        desired_ee_arr[:] = target_arr
-        actual_ee_arr[:] = target_arr
-        traj_start_time = time.time()
-
-        trail_enabled = bool(CONFIG.get("trail_enabled", True))
-        trail_stride_steps = max(1, int(CONFIG.get("trail_stride_steps", 5)))
-        trail_max_points = max(0, int(CONFIG.get("trail_max_points", 1500)))
-        trail_radius = float(CONFIG.get("trail_radius", 0.01))
-        trail_rgba = np.array(
-            CONFIG.get("trail_rgba", [0.1, 0.7, 1.0, 1.0]), dtype=float
-        )
-        trail_step_counter = 0
-        target_traj = []
-
-        ee_trail_enabled = bool(CONFIG.get("ee_trail_enabled", True))
-        ee_trail_stride_steps = max(1, int(CONFIG.get("ee_trail_stride_steps", 5)))
-        ee_trail_max_points = max(0, int(CONFIG.get("ee_trail_max_points", 1500)))
-        ee_desired_radius = float(CONFIG.get("ee_desired_trail_radius", 0.01))
-        ee_actual_radius = float(CONFIG.get("ee_actual_trail_radius", 0.01))
-        ee_desired_rgba = np.array(
-            CONFIG.get("ee_desired_trail_rgba", [0.2, 0.9, 0.2, 1.0]), dtype=float
-        )
-        ee_actual_rgba = np.array(
-            CONFIG.get("ee_actual_trail_rgba", [1.0, 0.5, 0.1, 1.0]), dtype=float
-        )
-        ee_step_counter = 0
-        ee_desired_traj = []
-        ee_actual_traj = []
-
-        control_dt = mj_model.opt.timestep * float(CONFIG["control_decimation"])
+        delay_s = float(CONFIG["control_start_delay"])
+        ramp_s = float(CONFIG["control_ramp_time"])
+        max_delta = float(CONFIG["control_max_delta"])
         control_print_every = int(CONFIG["control_print_every"])
 
-        control_process = mp.Process(
-            target=self._control_worker,
-            args=(
-                qpos_shared,
-                ctrl_shared,
-                target_shared,
-                desired_ee_shared,
-                actual_ee_shared,
-                run_flag,
-                control_dt,
-                control_print_every,
-            ),
-            daemon=True,
+        arm_kin, arm_ctrl, rover_ctrl, task = self._init_controllers()
+        shared = self._init_shared_state(qpos_len, arm_len, base_body_id, arm_kin)
+
+        sim_lock = threading.Lock()
+        stop_event = threading.Event()
+
+        control_state = {
+            "counter": 0,
+            "fps": FPSCounter(print_every=control_print_every, label="control_thread"),
+            "start_time": time.perf_counter(),
+            "stop_event": stop_event,
+        }
+        sim_state = {
+            "start_time": time.perf_counter(),
+            "stop_event": stop_event,
+        }
+        vision_state = {
+            "renderer": None,
+            "frame_idx": 0,
+            "warned_no_writer": False,
+            "stop_event": stop_event,
+        }
+
+        ros_pub = self._init_ros_pub()
+
+        if thread_cfg["vision_use_process"]:
+            log_and_print(
+                "[vision] MuJoCo camera uses shared mj_data; forcing vision_use_process=False"
+            )
+            thread_cfg["vision_use_process"] = False
+
+        control_step = self._build_control_step(
+            shared,
+            rover_ctrl,
+            task,
+            arm_ctrl,
+            thread_cfg["control_hz"],
+            control_print_every,
+            ros_pub,
+            control_state,
         )
-        control_process.start()
+        sim_step = self._build_sim_step(
+            shared,
+            sim_lock,
+            target_geom_id,
+            base_body_id,
+            arm_kin,
+            qpos_len,
+            ctrl_start,
+            ctrl_end,
+            delay_s,
+            ramp_s,
+            max_delta,
+            sim_state,
+        )
+        vision_step = self._build_vision_step(sim_lock, vision_state, thread_cfg)
+
+        pool = ThreadPool()
+        pool.add_task(
+            "control",
+            control_step,
+            thread_cfg["control_hz"],
+            print_every=thread_cfg["stat_print_every"],
+            warn_overrun=thread_cfg["overrun_warn"],
+        )
+        pool.add_task(
+            "sim",
+            sim_step,
+            thread_cfg["sim_hz"],
+            print_every=thread_cfg["stat_print_every"],
+            warn_overrun=thread_cfg["overrun_warn"],
+        )
+        if thread_cfg["vision_use_process"]:
+            pool.add_process_task(
+                "vision",
+                vision_step,
+                thread_cfg["vision_hz"],
+                print_every=thread_cfg["stat_print_every"],
+                warn_overrun=thread_cfg["overrun_warn"],
+            )
+        else:
+            pool.add_task(
+                "vision",
+                vision_step,
+                thread_cfg["vision_hz"],
+                print_every=thread_cfg["stat_print_every"],
+                warn_overrun=thread_cfg["overrun_warn"],
+            )
+        pool.start()
 
         try:
-            while self.is_running():
-                qpos_arr[:] = mj_data.qpos[:qpos_len]
-                mj_data.ctrl[ctrl_start:ctrl_end] = ctrl_arr
-
-                t = time.time() - traj_start_time
-                target_arr[:] = _trajectory_point(t)
-
-                mj_model.geom_pos[target_geom_id] = target_arr
-
-                if trail_enabled and trail_max_points > 0:
-                    trail_step_counter += 1
-                    if trail_step_counter % trail_stride_steps == 0:
-                        target_traj.append(target_arr.copy())
-                        if len(target_traj) > trail_max_points:
-                            target_traj = target_traj[-trail_max_points:]
-
-                if ee_trail_enabled and ee_trail_max_points > 0:
-                    ee_step_counter += 1
-                    if ee_step_counter % ee_trail_stride_steps == 0:
-                        ee_desired_traj.append(desired_ee_arr.copy())
-                        ee_actual_traj.append(actual_ee_arr.copy())
-                        if len(ee_desired_traj) > ee_trail_max_points:
-                            ee_desired_traj = ee_desired_traj[-ee_trail_max_points:]
-                        if len(ee_actual_traj) > ee_trail_max_points:
-                            ee_actual_traj = ee_actual_traj[-ee_trail_max_points:]
-
-                if (trail_enabled and len(target_traj) > 1) or (
-                    ee_trail_enabled
-                    and (len(ee_desired_traj) > 1 or len(ee_actual_traj) > 1)
-                ):
-                    self.viewer_handle.user_scn.ngeom = 0
-
-                if trail_enabled and len(target_traj) > 1:
-                    for i in range(len(target_traj) - 1):
-                        add_visual_capsule(
-                            self.viewer_handle,
-                            target_traj[i],
-                            target_traj[i + 1],
-                            trail_radius,
-                            trail_rgba,
-                        )
-
-                if ee_trail_enabled and len(ee_desired_traj) > 1:
-                    for i in range(len(ee_desired_traj) - 1):
-                        add_visual_capsule(
-                            self.viewer_handle,
-                            ee_desired_traj[i],
-                            ee_desired_traj[i + 1],
-                            ee_desired_radius,
-                            ee_desired_rgba,
-                        )
-
-                if ee_trail_enabled and len(ee_actual_traj) > 1:
-                    for i in range(len(ee_actual_traj) - 1):
-                        add_visual_capsule(
-                            self.viewer_handle,
-                            ee_actual_traj[i],
-                            ee_actual_traj[i + 1],
-                            ee_actual_radius,
-                            ee_actual_rgba,
-                        )
-
-                mujoco.mj_step(mj_model, mj_data)
-                self.sync()
-
-                time_until_next_step = mj_model.opt.timestep - (
-                    time.time() - step_start
-                )
-                if time_until_next_step > 0:
-                    time.sleep(time_until_next_step)
-                step_start = time.time()
+            self._run_view_loop(
+                shared,
+                sim_lock,
+                trail_state,
+                thread_cfg["view_hz"],
+                thread_cfg["stat_print_every"],
+                stop_event,
+            )
         finally:
-            run_flag.value = False
-            control_process.join(timeout=2.0)
-
-        while True:
-            time.sleep(0.01)
+            stop_event.set()
+            pool.stop()
 
 
 if __name__ == "__main__":
     log_path = init_run_logger(LOG_ROOT, "arm_end_control")
     log_and_print(f"[logger] logging to {log_path}")
-    print_pinocchio_info()
+    # print_pinocchio_info(ph_model, log_and_print)
     viewer = CustomViewer(mj_model, mj_data)
     viewer.cam.distance = float(CONFIG["cam_distance"])
     viewer.cam.azimuth = float(CONFIG["cam_azimuth"])
